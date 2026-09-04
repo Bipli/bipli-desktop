@@ -1,0 +1,14 @@
+{
+  "name": "bipli-desktop",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Spike shell — proving the Twilio Voice SDK behaves in Electron before any product is built on it.",
+  "main": "src/main.js",
+  "scripts": {
+    "spike": "electron .",
+    "spike:staging": "cross-env BIPLI_URL=https://staging.bipli.com electron ."
+  },
+  "devDependencies": {
+    "electron": "44.1.1"
+  }
+}
