@@ -122,6 +122,33 @@ and a browser tab registers two devices and rings both. Expected under the
 existing fan-out model, not a defect — but worth knowing before it surprises
 someone during the test.
 
+### 7. ⚠️ "It never dies" also means "it never restarts"
+
+Confirmed architecture: the shell loads **live bipli.com**, no offline bundle.
+App updates ride Republish, shell updates ride electron-updater. That is the
+right split — but it creates a failure mode the browser never had.
+
+A browser tab gets reloaded constantly: people close laptops, restart, open new
+tabs. A tray app that survives the user **does not navigate for weeks**. So:
+
+- **A Republish does not reach a running desktop client.** `loadURL` happens
+  once at launch. A user who never quits can hold a months-old bundle while
+  every browser user is current — and the desktop cohort is precisely the one we
+  have promised will never be closed. Every fix in this session's presence work
+  would sit unapplied on the machines that need it most.
+- **The service worker compounds it.** The app already registers one; its cached
+  assets outlive the page.
+- **There is no rollback path.** A breaking web change hits every desktop client
+  at once, and electron-updater cannot help — it ships the shell, not the page.
+
+Neither is a reason to bundle the app offline; that trade is worse. It is a
+reason to decide, before shipping, **how a running shell learns the page moved
+on** — a version check that prompts or reloads on idle, or a reload when the
+window has been hidden past some threshold. Cheap now, and awkward once there
+are installs in the field.
+
+Flagging, not building: it is downstream of finding 1 like everything else.
+
 ---
 
 ## The test — run exactly this
