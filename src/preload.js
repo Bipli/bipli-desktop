@@ -38,55 +38,98 @@ setInterval(() => {
   last = now;
 }, INTERVAL_MS);
 
-// Report what the media stack can actually see. Device LABELS are the tell: an
-// empty label means permission was not really granted, which is what breaks the
-// input/output selectors even when audio itself works.
-window.addEventListener("load", async () => {
+// =============================================================================
+// (b) DEVICE LABELS AND THE MISSING "default" SINK — round 2's other blocker.
+//
+// Reported: labels empty even though `permission media → GRANT`, and
+// `speakerDevices.set failed: Devices not found: default`.
+//
+// 🔑 THE APP ALREADY DIAGNOSED THIS, IN A BROWSER. useTwilioDevice.tsx:620:
+//   "Mic permission must be granted before constructing the Device. Without it,
+//    Chrome's enumerateDevices() hides the synthetic 'default' deviceId, and the
+//    SDK's AudioHelper fails to bind an output sink."
+// That is the reported symptom exactly — empty labels AND a missing "default".
+// So this is not an Electron mystery: it is the known no-grant-yet state. The
+// app guards it by calling getUserMedia inside ensureDevice, but its device
+// ENUMERATION runs on its own schedule, and under Electron the handler-granted
+// permission does not appear to carry the same weight as a browser's persisted
+// user grant.
+//
+// ⚠️ SO THE SHELL WARMS THE GRANT, AND THAT IS A LEGITIMATE SHELL JOB — "the
+// shell guarantees the page stays alive and audible". One getUserMedia at load,
+// released immediately, before the app enumerates.
+//
+// ⚠️ AND IT MEASURES BEFORE AND AFTER, because if warming does NOT populate the
+// labels then the cause is something else entirely and we must not go on
+// believing we fixed it. The two inventories are the evidence either way.
+// =============================================================================
+async function inventory(when) {
   try {
     const devices = await navigator.mediaDevices.enumerateDevices();
     const audio = devices.filter((d) => d.kind === "audioinput" || d.kind === "audiooutput");
-    const labelled = audio.filter((d) => d.label && d.label.length > 0).length;
-    console.log(
-      `[spike-probe] audio devices=${audio.length} labelled=${labelled}` +
-        (labelled === 0 && audio.length > 0 ? "  🔴 LABELS EMPTY — selectors will be blank" : ""),
-    );
-    const el = document.createElement("audio");
-    console.log(`[spike-probe] setSinkId supported=${typeof el.setSinkId === "function"}`);
-    console.log(`[spike-probe] Notification.permission=${Notification.permission}`);
-    console.log(`[spike-probe] serviceWorker supported=${"serviceWorker" in navigator}`);
+    const labelled = audio.filter((d) => d.label).length;
+    const outputs = audio.filter((d) => d.kind === "audiooutput");
+    const hasDefaultSink = outputs.some((d) => d.deviceId === "default");
+    ipcRenderer.send("spike:devices", {
+      when,
+      summary:
+        `${audio.length} audio (${outputs.length} out), labelled=${labelled}` +
+        `, "default" sink ${hasDefaultSink ? "PRESENT" : "🔴 ABSENT — speakerDevices.set(\"default\") will throw"}`,
+      list: audio.map((d) => `${d.kind} id=${d.deviceId.slice(0, 24)} label=${d.label || "<EMPTY>"}`),
+    });
+    return { labelled, hasDefaultSink, outputs };
   } catch (e) {
-    console.log(`[spike-probe] enumerate failed: ${e && e.message}`);
+    ipcRenderer.send("spike:devices", { when, summary: `enumerate failed: ${e && e.message}`, list: [] });
+    return null;
   }
+}
+
+window.addEventListener("load", async () => {
+  const before = await inventory("before mic grant");
+  let stream = null;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    console.log("[spike-probe] getUserMedia OK — grant warmed");
+  } catch (e) {
+    console.log(`[spike-probe] 🔴 getUserMedia FAILED: ${e && e.name}: ${e && e.message}`);
+  } finally {
+    // Release immediately. The SDK opens its own stream inside connect();
+    // holding this one would pin the mic and light the OS in-use indicator for
+    // the whole session.
+    if (stream) stream.getTracks().forEach((t) => t.stop());
+  }
+  const after = await inventory("after mic grant");
+
+  // Prove which sink id actually binds, rather than assuming "default" does.
+  const el = document.createElement("audio");
+  if (typeof el.setSinkId === "function" && after) {
+    for (const id of ["default", ...(after.outputs[0] ? [after.outputs[0].deviceId] : [])]) {
+      try {
+        await el.setSinkId(id);
+        console.log(`[spike-probe] setSinkId("${id.slice(0, 20)}") OK`);
+      } catch (e) {
+        console.log(`[spike-probe] setSinkId("${id.slice(0, 20)}") FAILED: ${e && e.message}`);
+      }
+    }
+  } else {
+    console.log("[spike-probe] setSinkId unsupported");
+  }
+  console.log(`[spike-probe] Notification.permission=${Notification.permission} (popup path does not need it)`);
 });
 
-// =============================================================================
-// RING DETECTION — so an incoming call is never silent, even when every
-// notification path fails.
-//
-// 🔑 IT HOOKS THE APP'S OWN ALERT, IT DOES NOT INVENT ONE. The softphone already
-// decides when to alert a human and already assembles the caller and the dialled
-// line for the toast (notifications.ts). Hooking showNotification means the
-// shell reacts to exactly that decision — same moment, same payload — instead of
-// growing a second, parallel idea of what "ringing" means that could drift from
-// the app's. Nothing in the main repo changes, which is the point: this is a
-// shell, and the scope says no UI rewrite.
-//
-// It works even when the notification itself is refused: the call is made, we
-// see it, and the OS's answer to it is irrelevant to us bringing the window
-// back and flashing the taskbar. That is precisely the Windows case that failed
-// the first spike run.
-//
-// ⚠️ THIS IS A SPIKE-GRADE SIGNAL AND SHOULD NOT SURVIVE INTO THE PRODUCT AS-IS.
-// It is a monkey-patch on a browser API: it breaks the day notifications.ts
-// changes shape, silently, with the failure being "the phone stopped surfacing"
-// — the worst possible failure mode to have depend on a patch. The durable
-// version is one explicit line from the web app (postMessage, or a
-// window.bipliDesktop call the shell exposes). Ship that before this ships.
-// =============================================================================
-
-function reportRing(via, title, body) {
+function reportRing(via, title, options) {
   try {
-    ipcRenderer.send("spike:ring", { via, title, body });
+    // The app tags its incoming-call notification with the callSid (data.callSid,
+    // falling back to the tag). Carrying it through means the popup's Answer
+    // names the SAME call the app is ringing about, rather than "whatever is
+    // ringing" — which matters the moment a second call arrives.
+    const d = (options && options.data) || {};
+    ipcRenderer.send("spike:ring", {
+      via,
+      title,
+      body: options && options.body,
+      callSid: d.callSid || (options && options.tag) || null,
+    });
   } catch {}
 }
 
@@ -95,7 +138,7 @@ function reportRing(via, title, body) {
 if (typeof ServiceWorkerRegistration !== "undefined" && ServiceWorkerRegistration.prototype.showNotification) {
   const orig = ServiceWorkerRegistration.prototype.showNotification;
   ServiceWorkerRegistration.prototype.showNotification = function (title, options) {
-    reportRing("sw.showNotification", title, options && options.body);
+    reportRing("sw.showNotification", title, options);
     return orig.apply(this, arguments);
   };
 }
@@ -106,7 +149,7 @@ if (typeof ServiceWorkerRegistration !== "undefined" && ServiceWorkerRegistratio
 if (typeof window.Notification === "function") {
   const OrigNotification = window.Notification;
   const Wrapped = function (title, options) {
-    reportRing("new Notification", title, options && options.body);
+    reportRing("new Notification", title, options);
     return new OrigNotification(title, options);
   };
   Wrapped.prototype = OrigNotification.prototype;
@@ -130,3 +173,33 @@ if (titleEl) {
     }
   }).observe(titleEl, { childList: true });
 }
+
+// =============================================================================
+// POPUP → APP. Answer / Decline from our own window, delivered on the contract
+// the app ALREADY has.
+//
+// 🔑 notifications.ts exports onNotificationAction(), which listens for
+// `{ type: "notification-action", callSid, action }` posted on the service-worker
+// message channel — the path a toast's action buttons take. Replaying that exact
+// message means the popup answers a call through the app's own wired handler,
+// not through a second mechanism that could drift from it. Nothing in the main
+// repo changes.
+//
+// ⚠️ SAME SPIKE-GRADE CAVEAT AS THE RING HOOK, and for the same reason: this
+// depends on a message shape it does not own, and its failure mode is a button
+// that silently does nothing. The durable version is an explicit bridge the web
+// app exposes. Ship that before this ships.
+// =============================================================================
+ipcRenderer.on("bipli:notification-action", (_e, { action, callSid }) => {
+  const msg = { type: "notification-action", callSid: callSid || "", action };
+  try {
+    if (navigator.serviceWorker) {
+      navigator.serviceWorker.dispatchEvent(new MessageEvent("message", { data: msg }));
+      console.log(`[spike-probe] delivered ${action} for ${callSid || "<no sid>"}`);
+    } else {
+      console.log("[spike-probe] 🔴 no serviceWorker container — cannot deliver popup action");
+    }
+  } catch (e) {
+    console.log(`[spike-probe] 🔴 popup action delivery failed: ${e && e.message}`);
+  }
+});

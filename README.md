@@ -234,6 +234,113 @@ signing, publish config and the download page all wait on the blank above.
 
 ---
 
+## Round 2 results — the premise HOLDS
+
+**Finding 1: PASS.** Ticks ±15ms across 25+ minutes of both minimise and
+close-hide. Presence survives a hidden window. That was the stop-the-line
+criterion and everything below is now worth building.
+
+Inbound while close-hidden rang and surfaced the window ✓.
+
+Three gaps came back, and the popup ruling collapses two of them into one.
+
+## Round 3 — what changed
+
+### (a) Minimised rang but did not surface
+
+The order was wrong. It asked `isVisible()` first — and on Windows a minimised
+window can still report visible, so `show()` was skipped, and `focus()` on a
+minimised window does nothing. Now `restore()` runs first, unconditionally, then
+`show()`; both are no-ops when they do not apply and neither is worth guarding
+on a ringing phone.
+
+⚠️ Also added the foreground workaround: **Windows blocks a background process
+from stealing foreground**, so a bare `focus()` is quietly ignored — the window
+returns but sits behind whatever the user is in. Briefly asserting always-on-top
+forces it, and it is dropped again immediately so the window does not hover over
+everything for the rest of the call.
+
+### (c) → the popup retires the toast question rather than solving it
+
+No `permission CHECK notifications` lines appeared because **the web app never
+asks** — the denial is the default, and there was never a grant to win. Chasing
+`requestPermission` through a service worker under Electron's permission model
+would be work spent to arrive back at a notification whose appearance, actions
+and lifetime we do not control.
+
+**Built the incoming-call popup instead.** Frameless, always-on-top at
+`"screen-saver"` level (outranks ordinary top-most windows and most full-screen
+apps), top-right of the work area, visible on all workspaces. Caller, dialled
+line, Answer / Decline, with Enter and Escape bound — a ringing phone should be
+answerable without aiming a mouse at a window that just appeared under the
+cursor. It appears with `showInactive()`, so it does not steal the caret.
+
+🔴 **It loads a local file, never bipli.com.** A second `BrowserWindow` pointed
+at the app would boot a second copy of the softphone and register a **second
+Twilio Device for the same user** — a phantom leg on every inbound call. The
+popup knows nothing but the caller string main hands it.
+
+**Answer/Decline travels back on the app's OWN contract.** `notifications.ts`
+already exports `onNotificationAction()`, listening for
+`{ type: "notification-action", callSid, action }` on the service-worker message
+channel — the path a toast's buttons take. The popup replays exactly that, so it
+answers through the handler the app already has rather than a second mechanism
+that could drift. The callSid is carried from the notification's `data.callSid`,
+so Answer names the *same* call the app is ringing about — which matters the
+moment a second call arrives.
+
+⚠️ Same spike-grade caveat as the ring hook, same reason: it depends on a
+message shape it does not own, and its failure mode is a button that silently
+does nothing. The durable version is an explicit bridge from the web app.
+
+### (b) Empty labels and the missing "default" sink — the app already diagnosed this
+
+Not an Electron mystery. `useTwilioDevice.tsx:620`, written for browsers:
+
+> Mic permission must be granted before constructing the Device. Without it,
+> Chrome's `enumerateDevices()` hides the synthetic "default" deviceId, and the
+> SDK's AudioHelper fails to bind an output sink.
+
+That is the reported symptom exactly — empty labels **and** a missing `default`,
+which is precisely why `speakerDevices.set("default")` threw. The app guards it
+by calling `getUserMedia` inside `ensureDevice`, but its device *enumeration*
+runs on its own schedule, and under Electron a handler-granted permission does
+not appear to carry the same weight as a browser's persisted user grant.
+
+So the shell **warms the grant**: one `getUserMedia` at load, released
+immediately (holding it would pin the mic and light the OS in-use indicator all
+session). That is a legitimate shell job — "the shell guarantees the page stays
+alive and audible".
+
+⚠️ **And it measures before AND after**, because if warming does not populate the
+labels then the cause is something else and we must not go on believing it is
+fixed. The probe prints both inventories, flags `"default" sink ABSENT`
+explicitly, and then tries `setSinkId` against both `"default"` and the first
+real output id — so the next run says which one actually binds instead of us
+assuming.
+
+If `default` is still absent after the grant, the durable fix is a small
+fallback in the web app (use the first `audiooutput` when the synthetic default
+is missing) — which would help any browser that hides it too. Not shipped on a
+theory; the inventory decides.
+
+---
+
+## Round 3 verification
+
+- Every IPC channel cross-checked main ↔ both preloads ↔ popup: no orphans in
+  either direction. (A typo'd channel is a silent no-op, which is the failure
+  mode this whole surface is prone to.)
+- `node --check` clean on all three scripts.
+- 🔴 **Not booted.** Electron will not start here — WSL2 is missing `libnspr4`
+  and friends. Installing them needs sudo on a machine where it still would not
+  exercise Windows foreground or always-on-top semantics, which is the whole
+  point of these changes. Runtime remains yours.
+
+Next: `npm run pack:win` for the packaged build.
+
+---
+
 ## The test — run exactly this
 
 Your success criterion, made falsifiable. Have `psql` open on prod alongside.

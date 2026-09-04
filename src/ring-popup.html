@@ -1,0 +1,50 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Incoming call</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; height: 100vh; display: flex; flex-direction: column; gap: 10px;
+    padding: 14px 16px; font: 13px/1.35 system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: #14161a; color: #f4f4f5; -webkit-app-region: drag; user-select: none;
+    border: 1px solid #2b2f36; border-radius: 10px; overflow: hidden;
+  }
+  .eyebrow { font-size: 10px; letter-spacing: .09em; text-transform: uppercase; color: #a1a1aa; }
+  .who { font-size: 17px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .line { font-size: 12px; color: #a1a1aa; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .actions { display: flex; gap: 8px; margin-top: auto; -webkit-app-region: no-drag; }
+  button {
+    flex: 1; border: 0; border-radius: 7px; padding: 9px 10px; font-size: 13px;
+    font-weight: 600; color: #fff; cursor: pointer; font-family: inherit;
+  }
+  /* Green = answer, red = decline. The house action-button law puts Call on
+     solid green; red here is the standard decline affordance on every phone
+     ever made, and this window has no other red in it to confuse it with. */
+  #answer  { background: #16a34a; }
+  #answer:hover  { background: #15803d; }
+  #decline { background: #dc2626; }
+  #decline:hover { background: #b91c1c; }
+</style>
+<div class="eyebrow">Incoming call</div>
+<div class="who" id="who">…</div>
+<div class="line" id="line"></div>
+<div class="actions">
+  <button id="decline" type="button">Decline</button>
+  <button id="answer" type="button">Answer</button>
+</div>
+<script>
+  const { onCall, respond } = window.ring;
+  onCall((d) => {
+    document.getElementById("who").textContent = d.who || "Unknown caller";
+    document.getElementById("line").textContent = d.line || "";
+  });
+  document.getElementById("answer").onclick = () => respond("answer");
+  document.getElementById("decline").onclick = () => respond("decline");
+  // Enter answers, Escape declines — a ringing phone should be answerable
+  // without aiming a mouse at a window that just appeared under the cursor.
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") respond("answer");
+    if (e.key === "Escape") respond("decline");
+  });
+</script>

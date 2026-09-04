@@ -241,10 +241,23 @@ function setCallState(next, detail) {
 const RAISE_ON_RING = process.env.BIPLI_RING_BEHAVIOUR || "raise"; // raise | flash
 function surfaceForRing(detail) {
   if (!win) return;
-  if (!win.isVisible()) win.show();
+  // 🔴 ROUND 2: THE MINIMISED CASE RANG BUT DID NOT SURFACE, while close-hidden
+  // worked. The old order asked `isVisible()` first — and on Windows a
+  // minimised window can still report visible, so `show()` was skipped and
+  // `focus()` on a minimised window does nothing. Restore FIRST, unconditionally,
+  // then show; both are no-ops when they do not apply, and neither is worth
+  // guarding to save a microsecond on a ringing phone.
   if (win.isMinimized()) win.restore();
+  win.show();
   if (RAISE_ON_RING === "raise") {
+    // ⚠️ WINDOWS BLOCKS BACKGROUND PROCESSES FROM STEALING FOREGROUND, so a
+    // bare focus() is quietly ignored — the window comes back but stays behind
+    // whatever the user is in. Briefly asserting always-on-top is the standard
+    // way to force it, and it is dropped again immediately so the window does
+    // not sit over everything for the rest of the call.
+    win.setAlwaysOnTop(true);
     win.focus();
+    win.setAlwaysOnTop(false);
   } else {
     win.showInactive();
   }
@@ -260,6 +273,102 @@ function surfaceForRing(detail) {
   }
   setCallState("ringing", detail);
 }
+
+// =============================================================================
+// THE INCOMING-CALL POPUP — ruled in round 2, and it retires the toast problem
+// rather than solving it.
+//
+// Round 2 found no `permission CHECK notifications` lines at all: the web app
+// never asks, so the denial is simply the default and there was never a grant
+// to win. Chasing requestPermission through a service worker under Electron's
+// permission model would be work spent to arrive back at a notification we do
+// not control the appearance, actions, or lifetime of. A window we own has
+// none of those constraints — and it surfaces regardless of what the MAIN
+// window is doing, which is also the honest fix for the minimised case.
+//
+// 🔴 IT LOADS A LOCAL FILE, NEVER bipli.com. A second BrowserWindow pointed at
+// the app would boot a second copy of the softphone and register a SECOND
+// Twilio Device for the same user — a phantom leg on every inbound call. The
+// popup knows nothing except the caller string main hands it.
+// =============================================================================
+let ringWin = null;
+let ringCallSid = null;
+
+function closeRingPopup() {
+  if (ringWin && !ringWin.isDestroyed()) ringWin.close();
+  ringWin = null;
+  ringCallSid = null;
+}
+
+function showRingPopup({ who, line, callSid }) {
+  ringCallSid = callSid ?? null;
+  if (ringWin && !ringWin.isDestroyed()) {
+    ringWin.webContents.send("ring:call", { who, line });
+    ringWin.showInactive();
+    return;
+  }
+  const { screen } = require("electron");
+  const area = screen.getPrimaryDisplay().workArea;
+  const W = 340;
+  const H = 176;
+  ringWin = new BrowserWindow({
+    width: W,
+    height: H,
+    // Top-right of the work area, clear of the taskbar wherever it lives.
+    x: area.x + area.width - W - 24,
+    y: area.y + 24,
+    frame: false,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    // skipTaskbar: a ringing phone should not leave a ghost taskbar button
+    // behind after it is answered.
+    skipTaskbar: true,
+    alwaysOnTop: true,
+    show: false,
+    webPreferences: {
+      preload: path.join(__dirname, "ring-preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      backgroundThrottling: false,
+    },
+  });
+  // "screen-saver" outranks ordinary always-on-top windows, including most
+  // full-screen apps. A call is exactly the interruption that earns that.
+  ringWin.setAlwaysOnTop(true, "screen-saver");
+  ringWin.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  ringWin.loadFile(path.join(__dirname, "ring-popup.html"));
+  ringWin.once("ready-to-show", () => {
+    ringWin.webContents.send("ring:call", { who, line });
+    // showInactive: appear without stealing the caret. The user can be
+    // mid-sentence; the window is loud enough by being on top.
+    ringWin.showInactive();
+  });
+  ringWin.on("closed", () => {
+    ringWin = null;
+  });
+}
+
+// Answer / Decline travel back through THE APP'S OWN CONTRACT — the
+// notification-action message its service-worker path already posts and
+// onNotificationAction() already handles. Reusing the wired handler beats
+// inventing a second way to answer a call that could drift from the first.
+ipcMain.on("ring:respond", (_e, { action }) => {
+  log(`popup → ${action}`);
+  if (win && !win.isDestroyed()) {
+    win.webContents.send("bipli:notification-action", { action, callSid: ringCallSid });
+  }
+  closeRingPopup();
+  if (action === "answer") {
+    if (win.isMinimized()) win.restore();
+    win.show();
+    win.focus();
+    setCallState("in-call");
+  } else {
+    setCallState("idle");
+  }
+});
 
 function createTray() {
   tray = new Tray(trayIcon("tray-idle"));
@@ -287,13 +396,23 @@ function createTray() {
 // why it hooks showNotification rather than inventing its own ring detection.
 ipcMain.on("spike:ring", (_e, p) => {
   log(`RING detected via ${p.via}: ${p.title ?? ""} ${p.body ?? ""}`);
+  showRingPopup({ who: p.title || null, line: p.body || null, callSid: p.callSid || null });
   surfaceForRing(p.title || null);
 });
 ipcMain.on("spike:ring-ended", (_e, p) => {
   log(`ring ended via ${p.via}`);
+  closeRingPopup();
   setCallState(p.answered ? "in-call" : "idle");
 });
-ipcMain.on("spike:call-ended", () => setCallState("idle"));
+ipcMain.on("spike:call-ended", () => {
+  closeRingPopup();
+  setCallState("idle");
+});
+// Device inventory from the probe — the round-2 blocker (b).
+ipcMain.on("spike:devices", (_e, p) => {
+  log(`devices (${p.when}): ${p.summary}`);
+  for (const d of p.list) log(`   ${d}`);
+});
 
 ipcMain.on("spike:drift", (_e, payload) => {
   const late = payload.actualMs - payload.expectedMs;
