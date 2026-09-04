@@ -2,13 +2,45 @@
   "name": "bipli-desktop",
   "version": "0.0.1",
   "private": true,
-  "description": "Spike shell — proving the Twilio Voice SDK behaves in Electron before any product is built on it.",
+  "description": "Spike shell \u2014 proving the Twilio Voice SDK behaves in Electron before any product is built on it.",
   "main": "src/main.js",
   "scripts": {
     "spike": "electron .",
-    "spike:staging": "cross-env BIPLI_URL=https://staging.bipli.com electron ."
+    "pack:win": "electron-builder --win --x64",
+    "pack:mac": "electron-builder --mac"
   },
   "devDependencies": {
-    "electron": "44.1.1"
+    "electron": "44.1.1",
+    "electron-builder": "26.15.3"
+  },
+  "build": {
+    "appId": "com.bipli.desktop",
+    "productName": "Bipli",
+    "files": [
+      "src/**/*",
+      "assets/**/*",
+      "package.json"
+    ],
+    "directories": {
+      "output": "dist"
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "signAndEditExecutable": true
+    },
+    "nsis": {
+      "createStartMenuShortcut": true,
+      "createDesktopShortcut": true,
+      "perMachine": false,
+      "oneClick": true
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "category": "public.app-category.business"
+    }
   }
 }

@@ -58,3 +58,75 @@ window.addEventListener("load", async () => {
     console.log(`[spike-probe] enumerate failed: ${e && e.message}`);
   }
 });
+
+// =============================================================================
+// RING DETECTION — so an incoming call is never silent, even when every
+// notification path fails.
+//
+// 🔑 IT HOOKS THE APP'S OWN ALERT, IT DOES NOT INVENT ONE. The softphone already
+// decides when to alert a human and already assembles the caller and the dialled
+// line for the toast (notifications.ts). Hooking showNotification means the
+// shell reacts to exactly that decision — same moment, same payload — instead of
+// growing a second, parallel idea of what "ringing" means that could drift from
+// the app's. Nothing in the main repo changes, which is the point: this is a
+// shell, and the scope says no UI rewrite.
+//
+// It works even when the notification itself is refused: the call is made, we
+// see it, and the OS's answer to it is irrelevant to us bringing the window
+// back and flashing the taskbar. That is precisely the Windows case that failed
+// the first spike run.
+//
+// ⚠️ THIS IS A SPIKE-GRADE SIGNAL AND SHOULD NOT SURVIVE INTO THE PRODUCT AS-IS.
+// It is a monkey-patch on a browser API: it breaks the day notifications.ts
+// changes shape, silently, with the failure being "the phone stopped surfacing"
+// — the worst possible failure mode to have depend on a patch. The durable
+// version is one explicit line from the web app (postMessage, or a
+// window.bipliDesktop call the shell exposes). Ship that before this ships.
+// =============================================================================
+
+function reportRing(via, title, body) {
+  try {
+    ipcRenderer.send("spike:ring", { via, title, body });
+  } catch {}
+}
+
+// (a) Service-worker notifications — the path the app actually uses, and the
+//     only one that can carry Answer/Decline actions.
+if (typeof ServiceWorkerRegistration !== "undefined" && ServiceWorkerRegistration.prototype.showNotification) {
+  const orig = ServiceWorkerRegistration.prototype.showNotification;
+  ServiceWorkerRegistration.prototype.showNotification = function (title, options) {
+    reportRing("sw.showNotification", title, options && options.body);
+    return orig.apply(this, arguments);
+  };
+}
+
+// (b) Page-level `new Notification(...)`, in case any path still uses it. Both
+//     are hooked because a missed ring is worse than a duplicate log line, and
+//     the main process de-duplicates by state anyway.
+if (typeof window.Notification === "function") {
+  const OrigNotification = window.Notification;
+  const Wrapped = function (title, options) {
+    reportRing("new Notification", title, options && options.body);
+    return new OrigNotification(title, options);
+  };
+  Wrapped.prototype = OrigNotification.prototype;
+  Object.defineProperty(Wrapped, "permission", { get: () => OrigNotification.permission });
+  Wrapped.requestPermission = (...a) => OrigNotification.requestPermission(...a);
+  window.Notification = Wrapped;
+}
+
+// Ring end / answered. The softphone puts the call state in the document title
+// ("On a call", "Incoming call…"), which is a weak signal — hence spike-grade.
+// Watching it is enough to prove the tray state machine works; the durable
+// version gets an explicit event.
+const titleEl = document.querySelector("title");
+if (titleEl) {
+  new MutationObserver(() => {
+    const t = (document.title || "").toLowerCase();
+    if (t.includes("on a call") || t.includes("in call")) {
+      ipcRenderer.send("spike:ring-ended", { via: "title", answered: true });
+    } else if (!t.includes("incoming")) {
+      ipcRenderer.send("spike:call-ended", {});
+    }
+  }).observe(titleEl, { childList: true });
+}

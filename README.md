@@ -151,6 +151,89 @@ Flagging, not building: it is downstream of finding 1 like everything else.
 
 ---
 
+## Round 1 results (Windows, Node 24 / Electron 44) — and what is still blank
+
+Reported: login OK · outbound two-way audio ✓ · inbound rings the window and
+answers with audio ✓ · no toast, `Notification.permission=denied`.
+
+🔴 **TWO RESULTS CAME BACK AS UNFILLED PLACEHOLDERS, AND ONE OF THEM IS THE
+STOP-THE-LINE CRITERION.**
+
+- **Hidden-window ticks — `[paste: throttled or not]`.** This is finding 1, the
+  premise the entire product rests on. Everything built since is on the
+  assumption it read `ok`. It costs ten minutes: run the spike, close the
+  window, watch the probe.
+- **Device labels — `[empty/populated after mic grant]`.** Decides whether the
+  input/output selectors work at all. The probe prints it on load.
+
+⚠️ **`Notification.permission=denied` IS NOT WHAT WAS PREDICTED, and letting
+"as predicted" stand would have sent us packaging a build to test the wrong
+thing.** The prediction was that Windows would not render Answer/Decline
+BUTTONS unpackaged. A flat denial is a different failure and the likeliest cause
+was this shell's own permission check, which compared `requestingOrigin` to our
+origin and returned false for anything else — including an empty string — with
+nothing logged to say why. The app raises notifications from a **service
+worker**, where `webContents` can be null and the origin does not arrive the way
+it does for a page.
+
+Both handlers now resolve the origin from three sources and **log every decision
+with the raw value**. Still origin-scoped — a shell that says yes to any origin
+is a browser with the address bar removed — but the next run reports the cause
+instead of us theorising a second time. Watch for `permission CHECK
+notifications origin=… → ALLOW/DENY` in the terminal.
+
+---
+
+## Round 2 — what is in the repo now
+
+**(1) Packaged Windows build.** `npm run pack:win` → NSIS installer in `dist/`.
+`appId` is `com.bipli.desktop` and `app.setAppUserModelId` matches it — a
+mismatch and toasts vanish with no error. `createStartMenuShortcut: true` is the
+point of the whole config: Windows routes a toast to an application identity,
+and without an installed shortcut carrying that ID the toast is dropped
+silently. That is why `npm run spike` could never settle this and why a
+per-machine install, not a portable exe, is the honest test.
+
+Unsigned, so SmartScreen will warn. Expected, dev-only, not the thing under test.
+
+**(2) Main-process Notification over IPC — deliberately NOT built.** You scoped
+it as conditional on the packaged build still denying. Building it now would
+mean building the fallback before knowing whether the primary works, and if the
+permission fix above is the real cause we would have written it for nothing.
+The hook it would need already exists (see below), so it is a small step when
+the packaged result is in.
+
+**(3) A ring is never silent, whatever notifications do.** Independent of any
+toast: the window returns and the taskbar flashes, and the tray shows
+idle / ringing / on-a-call.
+
+The shell learns about a ring by hooking the app's **own** alert
+(`showNotification`) rather than inventing a second idea of "ringing" that could
+drift from the app's — same moment, same caller and dialled-line payload, and no
+change to the main repo. It fires even when the OS refuses the notification,
+which is exactly the case that failed round 1.
+
+⚠️ **That hook is spike-grade and must not ship as-is.** It is a monkey-patch on
+a browser API: it breaks the day `notifications.ts` changes shape, silently, and
+the symptom is "the phone stopped surfacing calls" — the worst possible failure
+to hang on a patch. The durable version is one explicit line from the web app.
+Ship that before this ships.
+
+Tray colours are activity states, so they stay clear of the presence
+vocabulary's red (deliberately off) and amber (broken): green idle, white
+ringing, blue on-a-call. Icons are generated PNGs in `assets/`.
+
+⚠️ `show() + focus()` steals keyboard focus mid-typing. That is a product
+decision, not a technical one, and you asked for the assertive version — so it
+is the default. `BIPLI_RING_BEHAVIOUR=flash` gives the polite one
+(`showInactive` + taskbar flash). Worth a real opinion once you have lived with
+it.
+
+**Full electron-builder config beyond Windows/Mac targets — not yet.** Updater,
+signing, publish config and the download page all wait on the blank above.
+
+---
+
 ## The test — run exactly this
 
 Your success criterion, made falsifiable. Have `psql` open on prod alongside.

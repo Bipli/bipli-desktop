@@ -55,6 +55,14 @@ app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
 
 // One instance. A second launch surfaces the existing window instead of
 // registering a second Twilio Device for the same user.
+// ⚠️ WINDOWS TOASTS NEED THIS, AND NEED A START MENU SHORTCUT TOO. Windows
+// routes a notification to an application identity; without a matching AppUser
+// ModelID and an installed shortcut, a toast is silently dropped. Setting it
+// here is necessary and NOT sufficient — the shortcut only exists in a packaged
+// (NSIS) install, which is exactly why the toast question cannot be settled by
+// `npm run spike`. Must match electron-builder's appId.
+app.setAppUserModelId("com.bipli.desktop");
+
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
@@ -92,23 +100,64 @@ function createWindow() {
   // that is the product decision. Everything else, and every other origin, is
   // DENIED: this window can be navigated by a link, and a shell that says yes
   // to any origin is a browser with the address bar removed.
-  session.defaultSession.setPermissionRequestHandler((wc, permission, cb) => {
-    const requesting = (() => {
+  //
+  // 🔴 THE FIRST SPIKE RUN CAME BACK Notification.permission=denied ON WINDOWS,
+  // and it is worth being precise about what that does and does not mean. The
+  // PREDICTION was that Windows would not render Answer/Decline BUTTONS on an
+  // unpackaged build. Permission denied outright is a different failure, and
+  // the most likely culprit is this code rather than packaging.
+  //
+  // The app raises notifications from a SERVICE WORKER (notifications.ts —
+  // showNotification with actions, the only way a browser can put buttons on a
+  // toast). For a service-worker request Electron's `webContents` can be null
+  // and the origin does not necessarily arrive the way it does for a page. The
+  // old one-line check compared `requestingOrigin === ORIGIN` and returned
+  // false for anything else — including an empty string — so a mismatch reads
+  // as a flat denial with nothing in the log to say why.
+  //
+  // ⚠️ RESOLVED FROM THREE SOURCES, AND LOGGED EITHER WAY. Still origin-scoped:
+  // this window can be navigated by a link, and a shell that says yes to any
+  // origin is a browser with the address bar removed. But now a denial names
+  // the value it denied, so the next run reports the cause instead of us
+  // theorising about it a second time.
+  const resolveOrigin = (wc, requestingOrigin, details) => {
+    const tryOrigin = (u) => {
       try {
-        return new URL(wc.getURL()).origin;
+        return u ? new URL(u).origin : null;
       } catch {
         return null;
       }
-    })();
-    const allowed = ["media", "notifications", "clipboard-sanitized-write"];
-    const ok = requesting === ORIGIN && allowed.includes(permission);
-    log(`permission ${permission} from ${requesting} → ${ok ? "GRANT" : "DENY"}`);
+    };
+    return (
+      tryOrigin(requestingOrigin) ||
+      tryOrigin(details && (details.requestingUrl || details.securityOrigin)) ||
+      tryOrigin(wc && !wc.isDestroyed?.() ? wc.getURL() : null)
+    );
+  };
+
+  const ALLOWED = ["media", "notifications", "clipboard-sanitized-write"];
+
+  session.defaultSession.setPermissionRequestHandler((wc, permission, cb, details) => {
+    const origin = resolveOrigin(wc, details && details.requestingUrl, details);
+    const ok = origin === ORIGIN && ALLOWED.includes(permission);
+    log(
+      `permission REQUEST ${permission} origin=${origin ?? "<null>"} ` +
+        `raw=${JSON.stringify(details ?? null).slice(0, 200)} → ${ok ? "GRANT" : "DENY"}`,
+    );
     cb(ok);
   });
-  // Same rule for the synchronous check the media stack uses; without this the
-  // grant above can still be second-guessed and device labels come back empty.
-  session.defaultSession.setPermissionCheckHandler((wc, permission, requestingOrigin) => {
-    return requestingOrigin === ORIGIN && ["media", "notifications"].includes(permission);
+
+  session.defaultSession.setPermissionCheckHandler((wc, permission, requestingOrigin, details) => {
+    const origin = resolveOrigin(wc, requestingOrigin, details);
+    const ok = origin === ORIGIN && ALLOWED.includes(permission);
+    // Only log the interesting ones — media/notifications are checked often.
+    if (ALLOWED.includes(permission)) {
+      log(
+        `permission CHECK ${permission} origin=${origin ?? "<null>"} ` +
+          `requestingOrigin=${requestingOrigin ?? "<null>"} → ${ok ? "ALLOW" : "DENY"}`,
+      );
+    }
+    return ok;
   });
 
   win.on("close", (e) => {
@@ -135,15 +184,86 @@ function createWindow() {
   });
 }
 
+// =============================================================================
+// TRAY STATE — idle / ringing / on a call.
+//
+// 🎨 COLOUR NOTE, because the house has a status vocabulary and this is not it.
+// The presence-dot law fixes green=available, red=deliberately off,
+// amber=broken, grey=neutral — "never share a colour". These three are ACTIVITY
+// states, not presence states, so they deliberately stay clear of red and amber
+// rather than borrowing a meaning that already belongs to something else:
+//
+//   idle      green   — registered and available, the one state that IS presence
+//   ringing   white   — maximum contrast against both menu bars, plus a flashing
+//                       taskbar; a ring must be the loudest thing on screen
+//   on a call blue    — busy, distinct from both, and never confusable with the
+//                       broken/off pair
+// =============================================================================
+const ICONS = {};
+function trayIcon(name) {
+  if (!ICONS[name]) {
+    ICONS[name] = nativeImage.createFromPath(path.join(__dirname, "..", "assets", `${name}.png`));
+    // macOS menu-bar icons must be marked as templates or they render wrong in
+    // dark mode. Colour is lost there by design — the macOS state cue is the
+    // tooltip and the dock/flash, not the hue.
+    if (process.platform === "darwin") ICONS[name].setTemplateImage(false);
+  }
+  return ICONS[name];
+}
+
+let callState = "idle";
+function setCallState(next, detail) {
+  if (callState === next) return;
+  callState = next;
+  const label =
+    next === "ringing"
+      ? `Bipli. Incoming call${detail ? `: ${detail}` : ""}`
+      : next === "in-call"
+        ? "Bipli. On a call"
+        : "Bipli";
+  try {
+    tray.setImage(trayIcon(next === "ringing" ? "tray-ringing" : next === "in-call" ? "tray-incall" : "tray-idle"));
+    tray.setToolTip(label);
+  } catch (e) {
+    log("tray update failed", e && e.message);
+  }
+  log(`call state → ${next}${detail ? ` (${detail})` : ""}`);
+}
+
+// 🔑 AN INCOMING CALL MUST NEVER BE SILENT, EVEN IF EVERY NOTIFICATION PATH
+// FAILS. This is the belt to the toast's braces: whatever Windows decides about
+// permissions, the window comes back and the taskbar flashes.
+//
+// ⚠️ show() + focus() STEALS KEYBOARD FOCUS mid-typing, which is genuinely
+// unpleasant and is a product decision rather than a technical one. Both
+// behaviours are here; RAISE_ON_RING picks. Default is the assertive one you
+// asked for — flip it to "flash" if it turns out to be obnoxious in practice.
+const RAISE_ON_RING = process.env.BIPLI_RING_BEHAVIOUR || "raise"; // raise | flash
+function surfaceForRing(detail) {
+  if (!win) return;
+  if (!win.isVisible()) win.show();
+  if (win.isMinimized()) win.restore();
+  if (RAISE_ON_RING === "raise") {
+    win.focus();
+  } else {
+    win.showInactive();
+  }
+  // Taskbar flash on Windows/Linux. Harmless no-op on macOS, where the dock
+  // bounce is the equivalent and is driven by app.dock below.
+  try {
+    win.flashFrame(true);
+  } catch {}
+  if (process.platform === "darwin" && app.dock) {
+    try {
+      app.dock.bounce("critical");
+    } catch {}
+  }
+  setCallState("ringing", detail);
+}
+
 function createTray() {
-  // A 1x1 transparent image keeps the spike dependency-free; the real app ships
-  // proper idle/ringing/in-call icons. Tray presence is what is being proven
-  // here, not its artwork.
-  const img = nativeImage.createFromDataURL(
-    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAHElEQVQ4jWNgGAWjYBSMglEwCkbBKBgFo4CBAAAI8AAB/N6vLwAAAABJRU5ErkJggg==",
-  );
-  tray = new Tray(img);
-  tray.setToolTip("Bipli (spike)");
+  tray = new Tray(trayIcon("tray-idle"));
+  tray.setToolTip("Bipli");
   tray.setContextMenu(
     Menu.buildFromTemplate([
       { label: "Show Bipli", click: () => { win.show(); win.focus(); } },
@@ -163,6 +283,18 @@ function createTray() {
 // The probe's readings, printed in the terminal. This is the spike's actual
 // instrument: it turns "does presence survive being hidden" into a measured
 // number instead of a feeling.
+// The preload reports what the PAGE decided to alert about — see preload.js for
+// why it hooks showNotification rather than inventing its own ring detection.
+ipcMain.on("spike:ring", (_e, p) => {
+  log(`RING detected via ${p.via}: ${p.title ?? ""} ${p.body ?? ""}`);
+  surfaceForRing(p.title || null);
+});
+ipcMain.on("spike:ring-ended", (_e, p) => {
+  log(`ring ended via ${p.via}`);
+  setCallState(p.answered ? "in-call" : "idle");
+});
+ipcMain.on("spike:call-ended", () => setCallState("idle"));
+
 ipcMain.on("spike:drift", (_e, payload) => {
   const late = payload.actualMs - payload.expectedMs;
   const verdict = late > 5000 ? "🔴 THROTTLED" : late > 1500 ? "⚠️  late" : "ok";
