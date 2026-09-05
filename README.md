@@ -415,3 +415,56 @@ building it first would mean building on an unverified premise — which is the
 mistake this sequencing exists to prevent.
 
 This repo has **not** been pushed to GitHub. Creating the remote is yours.
+
+---
+
+## Round 3 results (packaged Windows) and round 4
+
+**Install OK, launches to tray, session shared.**
+
+**Toasts are dead, even packaged with a Start Menu shortcut and a matching
+AppUserModelID.** So the popup is not a fallback, it is the design — settled, and
+no more work goes into OS notifications.
+
+### 🔴 The popup did not appear when the main window was minimised
+
+⚠️ **It was never a child window.** The reported diagnosis was `parent:
+mainWindow`; there is no `parent` option anywhere in main.js and never has been,
+so children-minimise-with-parents cannot be the cause.
+
+What the code DID do was create the `BrowserWindow` at ring time and wait for
+`ready-to-show` before calling `showInactive`. That event is a **first paint**,
+and Chromium deprioritises painting for a process that is not in the foreground —
+so with the app minimised the window could be created and never reach the state
+that triggered its own show. Same code, different scheduling, invisible popup.
+
+**The popup is now built at startup, hidden.** On a ring it only calls `show()`:
+no construction, no page load, no waiting for a paint the compositor may never
+schedule. `setAlwaysOnTop(true, "screen-saver")` is re-asserted on every ring,
+because another app can claim that level and a window hidden while occluded does
+not always return on top. It is hidden and reused rather than closed, so the
+second call of a session is as fast as the first.
+
+📋 **And it now logs enough to be conclusive.** Every show prints
+`visible=… alwaysOnTop=… bounds=… mainMinimised=… mainVisible=…`, plus a loud
+line if the page fails to load. Round 3 could not distinguish "popup never
+created" from "created and not visible" — which is why the diagnosis had to be a
+guess. Round 4 will not have that problem.
+
+### Round 4 test
+
+1. Ring with the main window **visible** — regression check.
+2. Ring with the main window **minimised** — the reported failure.
+3. Ring with the window **hidden to tray** (closed, not minimised).
+4. Ring while a **full-screen app** is foreground.
+
+In each: does the popup appear, and what does the `ring popup shown:` line say?
+`visible=true` with no popup on screen is a completely different bug from
+`visible=false`, and the log now tells them apart.
+
+⚠️ **Two things in the brief came through unfilled and are still unanswered:**
+"Answer connects? [Sam confirms]" — whether the popup's Answer actually connects
+the call is the single most important open question, because it exercises the
+notification-action contract replay, which is the spike-grade monkey-patch this
+build depends on. And "round 4 as briefed" refers to a brief that has not been
+given; the four cases above are my proposal, not a restatement of it.

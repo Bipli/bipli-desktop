@@ -294,19 +294,23 @@ function surfaceForRing(detail) {
 let ringWin = null;
 let ringCallSid = null;
 
-function closeRingPopup() {
-  if (ringWin && !ringWin.isDestroyed()) ringWin.close();
-  ringWin = null;
-  ringCallSid = null;
-}
-
-function showRingPopup({ who, line, callSid }) {
-  ringCallSid = callSid ?? null;
-  if (ringWin && !ringWin.isDestroyed()) {
-    ringWin.webContents.send("ring:call", { who, line });
-    ringWin.showInactive();
-    return;
-  }
+// 🔴 THE POPUP IS BUILT AT STARTUP, NOT ON THE RING — and this is the fix for
+// "appears when the main window is visible, does not when it is minimised".
+//
+// ⚠️ IT WAS NEVER A CHILD WINDOW. The reported diagnosis was `parent:
+// mainWindow`; there is no `parent` option anywhere in this file and never was,
+// so children-minimise-with-parents cannot be it. What the old code DID do was
+// create the BrowserWindow at ring time and wait for `ready-to-show` before
+// calling showInactive. That event is a FIRST PAINT, and Chromium deprioritises
+// painting for a process that is not in the foreground — so with the app
+// minimised the window could be created and simply never reach the state that
+// triggered its own show. Same code, different scheduling, invisible popup.
+//
+// A ringing window also has no time to spare for constructing a BrowserWindow
+// and loading a page. Building it once at boot and only calling show() on the
+// ring removes creation, loading and first-paint from the ring path entirely.
+function buildRingWindow() {
+  if (ringWin && !ringWin.isDestroyed()) return ringWin;
   const { screen } = require("electron");
   const area = screen.getPrimaryDisplay().workArea;
   const W = 340;
@@ -314,16 +318,15 @@ function showRingPopup({ who, line, callSid }) {
   ringWin = new BrowserWindow({
     width: W,
     height: H,
-    // Top-right of the work area, clear of the taskbar wherever it lives.
     x: area.x + area.width - W - 24,
     y: area.y + 24,
+    // ⚠️ NO `parent`. Independent top-level window, deliberately: it must
+    // outlive, out-rank and out-live the visibility of the main window.
     frame: false,
     resizable: false,
     minimizable: false,
     maximizable: false,
     fullscreenable: false,
-    // skipTaskbar: a ringing phone should not leave a ghost taskbar button
-    // behind after it is answered.
     skipTaskbar: true,
     alwaysOnTop: true,
     show: false,
@@ -334,20 +337,49 @@ function showRingPopup({ who, line, callSid }) {
       backgroundThrottling: false,
     },
   });
-  // "screen-saver" outranks ordinary always-on-top windows, including most
-  // full-screen apps. A call is exactly the interruption that earns that.
   ringWin.setAlwaysOnTop(true, "screen-saver");
   ringWin.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
   ringWin.loadFile(path.join(__dirname, "ring-popup.html"));
-  ringWin.once("ready-to-show", () => {
-    ringWin.webContents.send("ring:call", { who, line });
-    // showInactive: appear without stealing the caret. The user can be
-    // mid-sentence; the window is loud enough by being on top.
-    ringWin.showInactive();
+  ringWin.webContents.on("did-fail-load", (_e, code, desc) =>
+    log(`🔴 ring popup FAILED TO LOAD ${code} ${desc} — no popup will appear`),
+  );
+  ringWin.webContents.once("did-finish-load", () => log("ring popup preloaded and ready"));
+  // Never destroyed by a close; hidden and reused.
+  ringWin.on("close", (e) => {
+    if (!quitting) {
+      e.preventDefault();
+      ringWin.hide();
+    }
   });
-  ringWin.on("closed", () => {
-    ringWin = null;
-  });
+  return ringWin;
+}
+
+function hideRingPopup() {
+  if (ringWin && !ringWin.isDestroyed()) ringWin.hide();
+  ringCallSid = null;
+}
+
+function showRingPopup({ who, line, callSid }) {
+  ringCallSid = callSid ?? null;
+  const w = buildRingWindow();
+  try {
+    w.webContents.send("ring:call", { who, line });
+    // Re-assert on every ring: another app can take screen-saver level, and a
+    // window that was hidden while occluded does not always come back on top.
+    w.setAlwaysOnTop(true, "screen-saver");
+    w.showInactive();
+    w.moveTop();
+    // 📋 THE LINE THAT MAKES THE NEXT TEST CONCLUSIVE. Without it we cannot tell
+    // "popup never created" from "created and not visible" — which is exactly
+    // the ambiguity that made this round's report a guess.
+    log(
+      `ring popup shown: visible=${w.isVisible()} alwaysOnTop=${w.isAlwaysOnTop()} ` +
+        `bounds=${JSON.stringify(w.getBounds())} mainMinimised=${win ? win.isMinimized() : "?"} ` +
+        `mainVisible=${win ? win.isVisible() : "?"}`,
+    );
+  } catch (e) {
+    log(`🔴 ring popup show FAILED: ${e && e.message}`);
+  }
 }
 
 // Answer / Decline travel back through THE APP'S OWN CONTRACT — the
@@ -359,7 +391,7 @@ ipcMain.on("ring:respond", (_e, { action }) => {
   if (win && !win.isDestroyed()) {
     win.webContents.send("bipli:notification-action", { action, callSid: ringCallSid });
   }
-  closeRingPopup();
+  hideRingPopup();
   if (action === "answer") {
     if (win.isMinimized()) win.restore();
     win.show();
@@ -401,11 +433,11 @@ ipcMain.on("spike:ring", (_e, p) => {
 });
 ipcMain.on("spike:ring-ended", (_e, p) => {
   log(`ring ended via ${p.via}`);
-  closeRingPopup();
+  hideRingPopup();
   setCallState(p.answered ? "in-call" : "idle");
 });
 ipcMain.on("spike:call-ended", () => {
-  closeRingPopup();
+  hideRingPopup();
   setCallState("idle");
 });
 // Device inventory from the probe — the round-2 blocker (b).
@@ -431,6 +463,10 @@ app.whenReady().then(() => {
   log(`powerSaveBlocker active=${powerSaveBlocker.isStarted(powerBlockerId)}`);
   createWindow();
   createTray();
+  // Build the ring popup NOW, hidden. On the ring we only call show() — no
+  // construction, no page load, no waiting for a first paint the compositor may
+  // never schedule while the app is in the background.
+  buildRingWindow();
   log(`spike up — target ${BIPLI_URL}`);
 });
 
