@@ -468,3 +468,34 @@ the call is the single most important open question, because it exercises the
 notification-action contract replay, which is the spike-grade monkey-patch this
 build depends on. And "round 4 as briefed" refers to a brief that has not been
 given; the four cases above are my proposal, not a restatement of it.
+
+---
+
+## Tray icons
+
+**Windows uses the full app icon** — the same tile as the taskbar — because it
+carries its own background and therefore does not depend on the taskbar's
+colour. The previous white silhouette was invisible on a light taskbar, and
+measurably so: pure white against a light taskbar (#f3f3f3) is a luminance
+difference of 12, i.e. nothing.
+
+⚠️ **The Bipli app icon is a dark mark on a CREAM field, not a coloured mark on a
+dark one.** Worth knowing because it is the opposite of how it is usually
+described, and it decides how the tray reads: on a dark taskbar the cream tile
+is what you see, on a light taskbar it is the dark mark inside it. Measured on
+the generated 16px icon, 42% of pixels contrast strongly against a light taskbar
+and 67% against a dark one — it reads on both, which is what was asked for.
+
+If light-taskbar contrast ever matters more than dark, `favicon.png` is the dark
+rounded mark on transparency and is a one-argument change to the generator. It
+would invert the trade rather than remove it.
+
+Corners are rounded in the generator (22%): the source tile is opaque to the
+edge, and a hard square in the tray reads as a placeholder next to every other
+rounded icon.
+
+**macOS keeps the template approach** — the monochrome silhouette, black on
+transparent, inverted by the OS. Only idle is a template; ringing and on-call
+carry a coloured dot and a template would discard it.
+
+Regenerate with `node scripts/make-tray-icons.mjs`.

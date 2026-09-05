@@ -26,7 +26,12 @@ import fs from "node:fs";
 import zlib from "node:zlib";
 import path from "node:path";
 
-const SRC = process.argv[2] ?? "/home/samuel/bipli-mobile/assets/adaptive-icon-monochrome.png";
+// TWO SOURCES, because the two platforms need genuinely different images.
+//   Windows → the full app icon, the same one on the taskbar. It carries its own
+//             background, so it does not depend on the taskbar's colour.
+//   macOS   → the monochrome silhouette, which becomes a template image.
+const WIN_SRC = process.argv[2] ?? "/home/samuel/bipli-mobile/assets/icon.png";
+const MAC_SRC = process.argv[3] ?? "/home/samuel/bipli-mobile/assets/adaptive-icon-monochrome.png";
 const OUT = path.resolve(import.meta.dirname, "..", "assets");
 
 // --- PNG decode (8-bit RGBA only; the source is verified to be that) --------
@@ -154,6 +159,30 @@ function resize({ w, h, rgba }, tw, th) {
   return { w: tw, h: th, rgba: out };
 }
 
+/**
+ * Round the corners of a full-bleed tile.
+ *
+ * The app icon is a hard square (100% opaque to the edge). A square block in the
+ * tray reads as a placeholder next to every other rounded icon, so the corners
+ * are cut here rather than shipping a different source art.
+ */
+function roundCorners({ w, h, rgba }, radiusPct = 0.22) {
+  const out = Buffer.from(rgba);
+  const r = Math.max(1, Math.round(Math.min(w, h) * radiusPct));
+  const corners = [[r, r], [w - r, r], [r, h - r], [w - r, h - r]];
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const inX = x >= r && x <= w - r, inY = y >= r && y <= h - r;
+    if (inX || inY) continue; // straight edges and the middle stay put
+    // Only the four corner squares remain; find which one and test the radius.
+    let best = Infinity;
+    for (const [cx, cy] of corners) best = Math.min(best, Math.hypot(x + 0.5 - cx, y + 0.5 - cy));
+    const i = (y * w + x) * 4;
+    if (best > r) out[i + 3] = 0;
+    else if (best > r - 1) out[i + 3] = Math.round(out[i + 3] * (r - best));
+  }
+  return { w, h, rgba: out };
+}
+
 /** Recolour the silhouette, keeping its alpha. */
 function tint({ w, h, rgba }, [r, g, b]) {
   const out = Buffer.from(rgba);
@@ -196,21 +225,28 @@ const WHITE = [255, 255, 255], BLACK = [0, 0, 0];
 // meaning that already belongs to something else.
 const RINGING = [34, 197, 94], INCALL = [59, 130, 246];
 
-const src = cropToAlpha(readPng(SRC));
+// ⚠️ THE WINDOWS SOURCE IS NOT CROPPED TO ALPHA. It is a full-bleed tile with no
+// transparency, so there is no ink bounding box to find — cropping is what the
+// macOS silhouette needs, and applying it here would do nothing or worse.
+const winSrc = readPng(WIN_SRC);
+const macSrc = cropToAlpha(readPng(MAC_SRC));
 fs.mkdirSync(OUT, { recursive: true });
 
 const made = [];
 for (const [size, suffix] of [[16, ""], [32, "@2x"]]) {
-  const base = resize(src, size, size);
-  const win = tint(base, WHITE);
-  const mac = tint(base, BLACK);
-  const write = (name, img) => { writePng(path.join(OUT, name + ".png"), img.w, img.h, img.rgba); made.push(name); };
-  // Windows: white mark, coloured dot for the active states.
+  const write = (name, img) => {
+    writePng(path.join(OUT, name + ".png"), img.w, img.h, img.rgba);
+    made.push(name);
+  };
+
+  // --- Windows: the app icon itself, so it reads on any taskbar colour -----
+  const win = roundCorners(resize(winSrc, size, size));
   write(`tray-idle${suffix}`, win);
   write(`tray-ringing${suffix}`, dot(win, RINGING));
   write(`tray-incall${suffix}`, dot(win, INCALL));
-  // macOS: idle is a TEMPLATE (black, OS-inverted). Active states carry colour
-  // and therefore cannot be templates — see the header.
+
+  // --- macOS: idle is a TEMPLATE; the active states cannot be (see header) --
+  const mac = tint(resize(macSrc, size, size), BLACK);
   write(`trayTemplate${suffix}`, mac);
   write(`tray-ringing-mac${suffix}`, dot(mac, RINGING));
   write(`tray-incall-mac${suffix}`, dot(mac, INCALL));
