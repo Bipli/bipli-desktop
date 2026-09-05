@@ -159,6 +159,62 @@ function resize({ w, h, rgba }, tw, th) {
   return { w: tw, h: th, rgba: out };
 }
 
+
+/**
+ * Crop the app icon down to its INNER dark tile.
+ *
+ * 🔴 THE SOURCE IS A TILE INSIDE A TILE. icon.png is a 512px CREAM square with a
+ * 320px black rounded tile inset 96px on every side. Scaled straight to 16px the
+ * tray showed a tile-in-a-tile — a cream frame around the real icon — which is
+ * both ugly and wastes a third of the pixels at the size where pixels are
+ * scarcest.
+ *
+ * ⚠️ CREAM CANNOT BE REMOVED BY COLOUR. The B inside the tile is ALSO cream, so
+ * knocking out every cream pixel would erase the letter and leave a black
+ * lozenge. The cream to remove is the cream OUTSIDE the tile, and "outside" is a
+ * topological fact, not a colour one — so it is found by flood-filling inward
+ * from the four corners. Cream enclosed by black is never reached.
+ */
+function cropToInnerTile({ w, h, rgba }) {
+  const lum = (i) => 0.299 * rgba[i] + 0.587 * rgba[i + 1] + 0.114 * rgba[i + 2];
+  // 1. Flood the outer background from every corner.
+  const outside = new Uint8Array(w * h);
+  const stack = [0, w - 1, (h - 1) * w, h * w - 1];
+  for (const s of stack) outside[s] = 1;
+  while (stack.length) {
+    const idx = stack.pop();
+    const x = idx % w, y = (idx / w) | 0;
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const nx = x + dx, ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+      const ni = ny * w + nx;
+      if (outside[ni]) continue;
+      if (lum(ni * 4) < 150) continue; // hit the dark tile — stop
+      outside[ni] = 1;
+      stack.push(ni);
+    }
+  }
+  // 2. Bounding box of everything NOT outside = the tile.
+  let x0 = w, y0 = h, x1 = -1, y1 = -1;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    if (outside[y * w + x]) continue;
+    if (x < x0) x0 = x; if (x > x1) x1 = x;
+    if (y < y0) y0 = y; if (y > y1) y1 = y;
+  }
+  if (x1 < 0) throw new Error("no inner tile found");
+  const cw = x1 - x0 + 1, ch = y1 - y0 + 1;
+  const out = Buffer.alloc(cw * ch * 4);
+  for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++) {
+    const si = ((y + y0) * w + (x + x0)) * 4;
+    const di = (y * cw + x) * 4;
+    out[di] = rgba[si]; out[di + 1] = rgba[si + 1]; out[di + 2] = rgba[si + 2];
+    // Outside the tile becomes transparent; the tile's own rounded corners are
+    // preserved by this rather than re-cut, so the original curve survives.
+    out[di + 3] = outside[(y + y0) * w + (x + x0)] ? 0 : rgba[si + 3];
+  }
+  return { w: cw, h: ch, rgba: out };
+}
+
 /**
  * Round the corners of a full-bleed tile.
  *
@@ -228,7 +284,7 @@ const RINGING = [34, 197, 94], INCALL = [59, 130, 246];
 // ⚠️ THE WINDOWS SOURCE IS NOT CROPPED TO ALPHA. It is a full-bleed tile with no
 // transparency, so there is no ink bounding box to find — cropping is what the
 // macOS silhouette needs, and applying it here would do nothing or worse.
-const winSrc = readPng(WIN_SRC);
+const winSrc = cropToInnerTile(readPng(WIN_SRC));
 const macSrc = cropToAlpha(readPng(MAC_SRC));
 fs.mkdirSync(OUT, { recursive: true });
 
@@ -239,8 +295,10 @@ for (const [size, suffix] of [[16, ""], [32, "@2x"]]) {
     made.push(name);
   };
 
-  // --- Windows: the app icon itself, so it reads on any taskbar colour -----
-  const win = roundCorners(resize(winSrc, size, size));
+  // --- Windows: the INNER tile, so no cream frame wastes a third of a 16px
+  // icon. ⚠️ NOT re-rounded — the tile already carries its own corner radius,
+  // and cutting it again would shave the artwork.
+  const win = resize(winSrc, size, size);
   write(`tray-idle${suffix}`, win);
   write(`tray-ringing${suffix}`, dot(win, RINGING));
   write(`tray-incall${suffix}`, dot(win, INCALL));
@@ -251,4 +309,13 @@ for (const [size, suffix] of [[16, ""], [32, "@2x"]]) {
   write(`tray-ringing-mac${suffix}`, dot(mac, RINGING));
   write(`tray-incall-mac${suffix}`, dot(mac, INCALL));
 }
-console.log(`wrote ${made.length} icons to ${OUT}`);
+// 🔑 THE APP ICON HAS THE SAME DEFECT AND THE SAME FIX. build/icon.png feeds the
+// installer, the Start Menu entry and the macOS bundle, and it was a straight
+// copy of the cream-framed source — so every one of those showed a tile in a
+// tile too. Written from the cropped tile, which is 320px: above
+// electron-builder's 256 minimum, and honest pixels rather than an upscale.
+const BUILD_ICON = path.resolve(import.meta.dirname, "..", "build", "icon.png");
+fs.mkdirSync(path.dirname(BUILD_ICON), { recursive: true });
+writePng(BUILD_ICON, winSrc.w, winSrc.h, winSrc.rgba);
+console.log(`wrote ${made.length} tray icons to ${OUT}`);
+console.log(`wrote app icon ${winSrc.w}x${winSrc.h} to ${BUILD_ICON}`);
