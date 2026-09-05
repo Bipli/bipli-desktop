@@ -25,6 +25,7 @@ const { app, BrowserWindow, Tray, Menu, session, ipcMain, powerSaveBlocker, nati
 const path = require("path");
 
 const BIPLI_URL = process.env.BIPLI_URL || "https://bipli.com";
+const SHELL_VERSION = require("../package.json").version;
 const ORIGIN = new URL(BIPLI_URL).origin;
 
 let win = null;
@@ -86,6 +87,9 @@ function createWindow() {
     title: "Bipli",
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
+      // Hands the preload its own version without letting a renderer read
+      // package.json.
+      additionalArguments: [`--bipli-shell-version=${SHELL_VERSION}`],
       // Renderer-side half of the anti-throttling story. Default is TRUE,
       // which is the browser behaviour we are trying to escape.
       backgroundThrottling: false,
@@ -173,9 +177,42 @@ function createWindow() {
   win.on("show", () => log("window shown"));
   win.on("minimize", () => log("window minimized"));
 
+  // =========================================================================
+  // 🔑 TWO INDEPENDENT SIGNALS THAT THIS IS THE SHELL, and the page hides its
+  // "get the desktop app" prompt on EITHER.
+  //
+  // The prompt appeared inside the shell because it keyed on
+  // window.bipliDesktop, and the bridge was not attaching — one missing import
+  // in the preload took the bridge, Answer/Decline and the reload watch with it.
+  // The bug is fixed, but the lesson is that ONE signal was a single point of
+  // failure for "am I in the app", and it failed in the direction that shows a
+  // user an advert for the thing they are already using.
+  //
+  // A UA suffix is set from the main process, where no renderer script has to
+  // run for it to be true. If the bridge ever fails again, the prompt still
+  // stays hidden.
+  // =========================================================================
+  win.webContents.setUserAgent(
+    `${win.webContents.getUserAgent()} BipliDesktop/${SHELL_VERSION}`,
+  );
+
   win.loadURL(BIPLI_URL);
   win.webContents.on("did-fail-load", (_e, code, desc) => log(`LOAD FAILED ${code} ${desc}`));
-  win.webContents.on("did-finish-load", () => log(`loaded ${BIPLI_URL}`));
+  win.webContents.on("did-finish-load", () => {
+    log(`loaded ${BIPLI_URL}`);
+    // 🔴 VERIFY THE BRIDGE, DO NOT ASSUME IT. Its absence is silent by nature —
+    // no popup, no Answer, no reload watch, and no error anyone sees. This is
+    // the check that would have caught the missing import on the first run
+    // instead of after a packaged build and a bug report.
+    setTimeout(() => {
+      if (!bridgeAttached) {
+        log(
+          "🔴 BRIDGE NOT ATTACHED 5s after load — no ring popup, no Answer/Decline, " +
+            "no reload watch. Check the preload for a top-level throw.",
+        );
+      }
+    }, 5000);
+  });
   // Surface renderer console lines in the terminal, so the softphone's own
   // logging ([voip] device registered, heartbeat_skipped_unregistered, …) is
   // visible during the hidden-window test without opening devtools.
@@ -426,6 +463,15 @@ ipcMain.on("ring:respond", (_e, { action }) => {
 // keep deferring it.
 // =============================================================================
 let pendingReloadBuild = null;
+let bridgeAttached = false;
+
+ipcMain.on("shell:bridge-attached", (_e, { version }) => {
+  bridgeAttached = true;
+  log(`bridge attached (shell ${version})`);
+});
+ipcMain.on("shell:bridge-failed", (_e, { message }) => {
+  log(`🔴 bridge FAILED to attach: ${message}`);
+});
 
 function applyReloadIfIdle(why) {
   if (!pendingReloadBuild) return;

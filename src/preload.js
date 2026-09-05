@@ -15,7 +15,19 @@
 // because Y was hard" tell the spike doctrine warns about.
 // =============================================================================
 
-const { ipcRenderer } = require("electron");
+// ⚠️ contextBridge IS NOT OPTIONAL HERE, and leaving it out cost three features
+// silently. `contextBridge.exposeInMainWorld` sat at module top level with the
+// name undefined, so the preload threw a ReferenceError partway through and
+// everything below it — the bridge, the Answer/Decline listener, the version
+// poll — never evaluated. The file passes `node --check` because the syntax is
+// perfectly valid; only the reference is wrong. Syntax checking cannot catch
+// this class, which is why main.js now VERIFIES the bridge attached at runtime.
+const { contextBridge, ipcRenderer } = require("electron");
+
+// Injected by main.js via additionalArguments so the bridge can report the
+// shell's own version without reading package.json from the renderer.
+const SHELL_VERSION =
+  (process.argv.find((a) => a.startsWith("--bipli-shell-version=")) || "").split("=")[1] || "0.0.0";
 
 const INTERVAL_MS = 30_000; // deliberately the softphone's own heartbeat period
 let last = Date.now();
@@ -133,6 +145,7 @@ window.addEventListener("load", async () => {
 // =============================================================================
 const actionHandlers = new Set();
 
+try {
 contextBridge.exposeInMainWorld("bipliDesktop", {
   /** An incoming call is ringing. Told, not inferred. */
   ring: (r) => {
@@ -159,7 +172,19 @@ contextBridge.exposeInMainWorld("bipliDesktop", {
   onAction: (cb) => {
     if (typeof cb === "function") actionHandlers.add(cb);
   },
+  /** Version string, so the page can say what it is running inside. */
+  version: SHELL_VERSION,
 });
+  ipcRenderer.send("shell:bridge-attached", { version: SHELL_VERSION });
+} catch (e) {
+  // 🔴 A BRIDGE THAT FAILS TO ATTACH MUST NOT BE SILENT. It takes the ring
+  // popup, Answer/Decline and the reload watch with it, and every one of those
+  // fails as "nothing happened".
+  console.log(`[spike-probe] 🔴 BRIDGE FAILED TO ATTACH: ${e && e.message}`);
+  try {
+    ipcRenderer.send("shell:bridge-failed", { message: String((e && e.message) || e) });
+  } catch {}
+}
 
 ipcRenderer.on("bipli:notification-action", (_e, { action, callSid }) => {
   // Hand it to the web app's own handler. No synthetic MessageEvent, no
