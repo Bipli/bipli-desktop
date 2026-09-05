@@ -237,13 +237,39 @@ function createWindow() {
 //                       broken/off pair
 // =============================================================================
 const ICONS = {};
-function trayIcon(name) {
+
+// 🎨 PLATFORM SPLIT, AND IT IS NOT COSMETIC.
+//
+//   Windows tray sits on a dark taskbar   → WHITE Bipli mark.
+//   macOS menu bar takes a TEMPLATE image → BLACK on transparent; the OS
+//                                           inverts it for light/dark.
+//
+// 🔴 A TEMPLATE IMAGE IS RENDERED AS A MASK, SO COLOUR IN IT IS DISCARDED. A
+// coloured state dot inside a macOS template comes out as an indistinguishable
+// blob — the one thing the dot exists to convey. So on macOS only IDLE is a
+// template; ringing and on-call ship as ordinary coloured images and give up
+// automatic light/dark inversion. That is the right way round: those states are
+// transient and the colour IS the information, while idle is what sits in the
+// bar all day and has to look native.
+const IS_MAC = process.platform === "darwin";
+const TRAY_FILE = {
+  idle: IS_MAC ? "trayTemplate" : "tray-idle",
+  ringing: IS_MAC ? "tray-ringing-mac" : "tray-ringing",
+  "in-call": IS_MAC ? "tray-incall-mac" : "tray-incall",
+};
+
+function trayIcon(state) {
+  const name = TRAY_FILE[state] ?? TRAY_FILE.idle;
   if (!ICONS[name]) {
-    ICONS[name] = nativeImage.createFromPath(path.join(__dirname, "..", "assets", `${name}.png`));
-    // macOS menu-bar icons must be marked as templates or they render wrong in
-    // dark mode. Colour is lost there by design — the macOS state cue is the
-    // tooltip and the dock/flash, not the hue.
-    if (process.platform === "darwin") ICONS[name].setTemplateImage(false);
+    const img = nativeImage.createFromPath(path.join(__dirname, "..", "assets", `${name}.png`));
+    if (img.isEmpty()) {
+      // A missing icon makes the tray silently blank — which reads as the app
+      // having crashed. Say so.
+      log(`🔴 tray icon missing or unreadable: assets/${name}.png`);
+    }
+    // Only the idle mark is a template; see the note above.
+    if (IS_MAC) img.setTemplateImage(name === "trayTemplate");
+    ICONS[name] = img;
   }
   return ICONS[name];
 }
@@ -259,7 +285,7 @@ function setCallState(next, detail) {
         ? "Bipli. On a call"
         : "Bipli";
   try {
-    tray.setImage(trayIcon(next === "ringing" ? "tray-ringing" : next === "in-call" ? "tray-incall" : "tray-idle"));
+    tray.setImage(trayIcon(next));
     tray.setToolTip(label);
   } catch (e) {
     log("tray update failed", e && e.message);
@@ -561,7 +587,7 @@ function buildTrayMenu() {
 }
 
 function createTray() {
-  tray = new Tray(trayIcon("tray-idle"));
+  tray = new Tray(trayIcon("idle"));
   tray.setToolTip("Bipli");
   buildTrayMenu();
   tray.on("click", () => (win.isVisible() ? win.hide() : win.show()));
