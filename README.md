@@ -223,11 +223,11 @@ Tray colours are activity states, so they stay clear of the presence
 vocabulary's red (deliberately off) and amber (broken): green idle, white
 ringing, blue on-a-call. Icons are generated PNGs in `assets/`.
 
-⚠️ `show() + focus()` steals keyboard focus mid-typing. That is a product
-decision, not a technical one, and you asked for the assertive version — so it
-is the default. `BIPLI_RING_BEHAVIOUR=flash` gives the polite one
-(`showInactive` + taskbar flash). Worth a real opinion once you have lived with
-it.
+✅ **RULED: ring = popup only.** The main window is no longer restored, shown or
+focused on a ring — a phone ringing should not rearrange your desktop. Bringing
+the window forward is now Answer's job, where the user has asked for it, and the
+Windows foreground workaround moved there with it. `BIPLI_RING_BEHAVIOUR` is
+gone; it selected between two behaviours that no longer exist.
 
 **Full electron-builder config beyond Windows/Mac targets — not yet.** Updater,
 signing, publish config and the download page all wait on the blank above.

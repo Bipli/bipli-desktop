@@ -273,45 +273,30 @@ function setCallState(next, detail) {
   if (next === "idle") applyReloadIfIdle("call ended");
 }
 
-// 🔑 AN INCOMING CALL MUST NEVER BE SILENT, EVEN IF EVERY NOTIFICATION PATH
-// FAILS. This is the belt to the toast's braces: whatever Windows decides about
-// permissions, the window comes back and the taskbar flashes.
+// =============================================================================
+// 🔑 RING = POPUP ONLY. RULED. The main window is not restored, shown or
+// focused when a call comes in.
 //
-// ⚠️ show() + focus() STEALS KEYBOARD FOCUS mid-typing, which is genuinely
-// unpleasant and is a product decision rather than a technical one. Both
-// behaviours are here; RAISE_ON_RING picks. Default is the assertive one you
-// asked for — flip it to "flash" if it turns out to be obnoxious in practice.
-const RAISE_ON_RING = process.env.BIPLI_RING_BEHAVIOUR || "raise"; // raise | flash
-function surfaceForRing(detail) {
-  if (!win) return;
-  // 🔴 ROUND 2: THE MINIMISED CASE RANG BUT DID NOT SURFACE, while close-hidden
-  // worked. The old order asked `isVisible()` first — and on Windows a
-  // minimised window can still report visible, so `show()` was skipped and
-  // `focus()` on a minimised window does nothing. Restore FIRST, unconditionally,
-  // then show; both are no-ops when they do not apply, and neither is worth
-  // guarding to save a microsecond on a ringing phone.
-  if (win.isMinimized()) win.restore();
-  win.show();
-  if (RAISE_ON_RING === "raise") {
-    // ⚠️ WINDOWS BLOCKS BACKGROUND PROCESSES FROM STEALING FOREGROUND, so a
-    // bare focus() is quietly ignored — the window comes back but stays behind
-    // whatever the user is in. Briefly asserting always-on-top is the standard
-    // way to force it, and it is dropped again immediately so the window does
-    // not sit over everything for the rest of the call.
-    win.setAlwaysOnTop(true);
-    win.focus();
-    win.setAlwaysOnTop(false);
-  } else {
-    win.showInactive();
-  }
-  // Taskbar flash on Windows/Linux. Harmless no-op on macOS, where the dock
-  // bounce is the equivalent and is driven by app.dock below.
-  try {
-    win.flashFrame(true);
-  } catch {}
-  if (process.platform === "darwin" && app.dock) {
+// It used to be: restore, show, and force foreground via an always-on-top
+// juggle. That was written when the popup was unreliable and the main window
+// was the fallback — and it is the wrong behaviour now that the popup works. A
+// phone ringing should not rearrange your desktop. If you are mid-sentence in
+// another app, a small window appearing in the corner is an interruption you
+// can ignore; a whole browser-sized window shoving itself in front of you is
+// not.
+//
+// ⚠️ ONE THING SURVIVES, AND IT IS A JUDGEMENT CALL — the taskbar flash. It
+// touches no window state (no restore, no show, no focus), and it is the only
+// cue for a popup that has opened on a monitor you are not looking at. Say the
+// word and it goes; "popup only" could reasonably be read to exclude it.
+//
+// Bringing the main window forward is now ANSWER's job, where the user has
+// asked for it — see the ring:respond handler.
+// =============================================================================
+function markRinging(detail) {
+  if (win && !win.isDestroyed()) {
     try {
-      app.dock.bounce("critical");
+      win.flashFrame(true);
     } catch {}
   }
   setCallState("ringing", detail);
@@ -436,11 +421,31 @@ ipcMain.on("ring:respond", (_e, { action }) => {
   }
   hideRingPopup();
   if (action === "answer") {
-    if (win.isMinimized()) win.restore();
-    win.show();
-    win.focus();
+    // 🔑 THE RAISE LIVES HERE NOW — the one moment the user has actually asked
+    // for the window. Restore FIRST and unconditionally: on Windows a minimised
+    // window can still report visible, so an isVisible() check skips show(),
+    // and focus() on a minimised window does nothing.
+    if (win && !win.isDestroyed()) {
+      if (win.isMinimized()) win.restore();
+      win.show();
+      // ⚠️ WINDOWS BLOCKS A BACKGROUND PROCESS FROM STEALING FOREGROUND, so a
+      // bare focus() is quietly ignored and the window returns behind whatever
+      // you were in. Briefly asserting always-on-top forces it; dropped again
+      // at once so it does not hover for the rest of the call.
+      win.setAlwaysOnTop(true);
+      win.focus();
+      win.setAlwaysOnTop(false);
+      try {
+        win.flashFrame(false);
+      } catch {}
+    }
     setCallState("in-call");
   } else {
+    if (win && !win.isDestroyed()) {
+      try {
+        win.flashFrame(false);
+      } catch {}
+    }
     setCallState("idle");
   }
 });
@@ -570,7 +575,7 @@ function createTray() {
 ipcMain.on("spike:ring", (_e, p) => {
   log(`RING detected via ${p.via}: ${p.title ?? ""} ${p.body ?? ""}`);
   showRingPopup({ who: p.title || null, line: p.body || null, callSid: p.callSid || null });
-  surfaceForRing(p.title || null);
+  markRinging(p.title || null);
 });
 ipcMain.on("spike:ring-ended", (_e, p) => {
   log(`ring ended via ${p.via}`);
