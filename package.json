@@ -1,13 +1,14 @@
 {
   "name": "bipli-desktop",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "private": true,
-  "description": "Spike shell \u2014 proving the Twilio Voice SDK behaves in Electron before any product is built on it.",
+  "description": "Bipli Desktop \u2014 your Bipli phone as an app that stays running.",
   "main": "src/main.js",
   "scripts": {
     "spike": "electron .",
-    "pack:win": "electron-builder --win --x64",
-    "pack:mac": "electron-builder --mac"
+    "pack:win": "electron-builder --win --x64 --publish never",
+    "pack:mac": "electron-builder --mac --publish never",
+    "release": "electron-builder --publish always"
   },
   "devDependencies": {
     "electron": "44.1.1",
@@ -16,31 +17,68 @@
   "build": {
     "appId": "com.bipli.desktop",
     "productName": "Bipli",
+    "copyright": "Copyright \u00a9 2026 Bipli",
     "files": [
       "src/**/*",
       "assets/**/*",
       "package.json"
     ],
     "directories": {
-      "output": "dist"
+      "output": "dist",
+      "buildResources": "build"
     },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "Bipli",
+        "repo": "bipli-desktop"
+      }
+    ],
     "win": {
       "target": [
-        "nsis"
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
       ],
-      "signAndEditExecutable": true
+      "icon": "build/icon.png"
     },
     "nsis": {
+      "oneClick": true,
+      "perMachine": false,
       "createStartMenuShortcut": true,
       "createDesktopShortcut": true,
-      "perMachine": false,
-      "oneClick": true
+      "shortcutName": "Bipli",
+      "include": "build/installer.nsh"
     },
     "mac": {
       "target": [
-        "dmg"
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
       ],
-      "category": "public.app-category.business"
+      "icon": "build/icon.png",
+      "category": "public.app-category.business",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "notarize": true
     }
+  },
+  "author": {
+    "name": "Bipli",
+    "email": "sam@bipli.com"
+  },
+  "homepage": "https://bipli.com",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "electron-updater": "6.8.9"
   }
 }

@@ -228,6 +228,12 @@ function setCallState(next, detail) {
     log("tray update failed", e && e.message);
   }
   log(`call state → ${next}${detail ? ` (${detail})` : ""}`);
+  // Rebuild the menu so "Reload" enables/disables with the call, and take the
+  // chance to apply anything that was waiting for idle.
+  try {
+    if (tray) buildTrayMenu();
+  } catch {}
+  if (next === "idle") applyReloadIfIdle("call ended");
 }
 
 // 🔑 AN INCOMING CALL MUST NEVER BE SILENT, EVEN IF EVERY NOTIFICATION PATH
@@ -402,12 +408,95 @@ ipcMain.on("ring:respond", (_e, { action }) => {
   }
 });
 
-function createTray() {
-  tray = new Tray(trayIcon("tray-idle"));
-  tray.setToolTip("Bipli");
+// =============================================================================
+// RELOAD RULE — apply a new build, never mid-call.
+//
+// The shell is designed never to be quit, so loadURL happens once and a
+// Republish never reaches it. The preload polls /api/version and reports a
+// changed build id; THIS side decides what to do about it, because it is the
+// side that knows whether a call is up.
+//
+// 🔴 NEVER MID-CALL, AND "MID-CALL" INCLUDES RINGING. Reloading during a ring
+// destroys the renderer holding the Twilio Device that is being offered the
+// call — the caller hears it drop. So the pending reload is held and applied at
+// the first moment the app is idle, which is almost always seconds later.
+//
+// ⚠️ AND IT IS HELD, NOT DISCARDED. A dropped update would leave exactly the
+// stale client this exists to prevent, on the busiest user — the one whose calls
+// keep deferring it.
+// =============================================================================
+let pendingReloadBuild = null;
+
+function applyReloadIfIdle(why) {
+  if (!pendingReloadBuild) return;
+  if (callState !== "idle") {
+    log(`reload held (${callState}) — will apply when idle`);
+    return;
+  }
+  if (!win || win.isDestroyed()) return;
+  log(`reloading for build ${pendingReloadBuild} (${why})`);
+  pendingReloadBuild = null;
+  win.webContents.reloadIgnoringCache();
+}
+
+ipcMain.on("shell:build-changed", (_e, { commit }) => {
+  pendingReloadBuild = commit || "new";
+  log(`new build seen: ${pendingReloadBuild}`);
+  applyReloadIfIdle("build change");
+});
+
+function reloadNow() {
+  if (!win || win.isDestroyed()) return;
+  pendingReloadBuild = null;
+  log("manual reload from tray");
+  win.webContents.reloadIgnoringCache();
+}
+
+// =============================================================================
+// AUTO-UPDATE — the SHELL's own updates, which are a different thing from the
+// page's. The page updates by reloading; the shell updates by replacing itself.
+//
+// ⚠️ Downloads silently, applies on next launch, and NEVER restarts by itself.
+// quitAndInstall on a phone that is meant to be always-on would end a call to
+// install a version of the thing that was carrying it.
+// =============================================================================
+function initUpdater() {
+  // Unsigned dev builds have no update feed; failing loudly there is noise, not
+  // information.
+  if (!app.isPackaged) {
+    log("updater: skipped (not packaged)");
+    return;
+  }
+  try {
+    const { autoUpdater } = require("electron-updater");
+    autoUpdater.autoDownload = true;
+    autoUpdater.autoInstallOnAppQuit = true;
+    autoUpdater.on("update-available", (i) => log(`update available: ${i && i.version}`));
+    autoUpdater.on("update-downloaded", (i) =>
+      log(`update ${i && i.version} downloaded — applies on next launch`),
+    );
+    autoUpdater.on("error", (e) => log(`updater error: ${e && e.message}`));
+    void autoUpdater.checkForUpdates();
+    setInterval(() => void autoUpdater.checkForUpdates(), 6 * 60 * 60 * 1000);
+  } catch (e) {
+    log(`updater unavailable: ${e && e.message}`);
+  }
+}
+
+// The tray menu is REBUILT on every call-state change, so "Reload" reflects
+// whether it is currently safe. Electron menus are immutable once set — the only
+// way to change an item is to build a new menu.
+function buildTrayMenu() {
   tray.setContextMenu(
     Menu.buildFromTemplate([
       { label: "Show Bipli", click: () => { win.show(); win.focus(); } },
+      {
+        label: pendingReloadBuild ? "Reload (update ready)" : "Reload",
+        // ⚠️ Disabled during a call rather than hidden: a control that vanishes
+        // reads as a broken app, one that is greyed out explains itself.
+        enabled: callState === "idle",
+        click: () => reloadNow(),
+      },
       { type: "separator" },
       {
         label: "Quit Bipli",
@@ -418,6 +507,12 @@ function createTray() {
       },
     ]),
   );
+}
+
+function createTray() {
+  tray = new Tray(trayIcon("tray-idle"));
+  tray.setToolTip("Bipli");
+  buildTrayMenu();
   tray.on("click", () => (win.isVisible() ? win.hide() : win.show()));
 }
 
@@ -467,6 +562,7 @@ app.whenReady().then(() => {
   // construction, no page load, no waiting for a first paint the compositor may
   // never schedule while the app is in the background.
   buildRingWindow();
+  initUpdater();
   log(`spike up — target ${BIPLI_URL}`);
 });
 

@@ -1,0 +1,102 @@
+# =============================================================================
+# Build and release Bipli Desktop.
+#
+# 🔑 CI IS THE MAC. There is no Mac to build on, so macos-latest is not a
+# convenience here — it is the only way a signed, notarised DMG can exist at all.
+# That makes this workflow load-bearing rather than nice-to-have, and it is why
+# the Mac job must fail loudly rather than be skipped when credentials are
+# missing on a tagged run.
+#
+# Triggers:
+#   push tag v*  → build both, sign where credentials exist, publish a Release
+#   manual       → build both, publish nothing (a dry run that proves it compiles)
+# =============================================================================
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # electron-builder creates/updates the GitHub Release
+
+jobs:
+  build:
+    strategy:
+      # ⚠️ fail-fast OFF. One platform failing must not cancel the other — a
+      # half-finished release where you cannot see WHICH half failed is worse
+      # than two clear results.
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            script: pack:win
+          - os: macos-latest
+            script: pack:mac
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+
+      # --- macOS signing + notarisation ------------------------------------
+      # Present only when the secrets are set. electron-builder reads all of
+      # these from the environment; there is nothing to pass on the command line.
+      - name: Import Developer ID certificate
+        if: matrix.os == 'macos-latest' && env.MAC_CERT_P12 != ''
+        env:
+          MAC_CERT_P12: ${{ secrets.MAC_CERT_P12 }}
+        run: echo "certificate present"
+
+      - name: Build
+        env:
+          # electron-builder publishes to the repo this token belongs to.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # macOS Developer ID — base64 .p12 plus its password.
+          CSC_LINK: ${{ secrets.MAC_CERT_P12 }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+          # Notarisation via an App Store Connect API key (no app-specific
+          # password, no 2FA prompt in CI).
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_PATH }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          IS_TAG="${{ startsWith(github.ref, 'refs/tags/v') }}"
+          HAS_MAC_CERT="${{ secrets.MAC_CERT_P12 != '' }}"
+
+          # 🔴 A TAGGED MAC BUILD WITHOUT CREDENTIALS MUST FAIL, NOT SHIP.
+          # An unsigned DMG installs and then Gatekeeper refuses to open it — a
+          # release that looks successful and is unusable. Better to break the
+          # build than to publish that.
+          if [ "${{ matrix.os }}" = "macos-latest" ] && [ "$IS_TAG" = "true" ] && [ "$HAS_MAC_CERT" != "true" ]; then
+            echo "::error::Tagged macOS release with no MAC_CERT_P12 — an unsigned DMG is not a release."
+            exit 1
+          fi
+
+          # Windows signing is a follow-up (Azure Artifact Signing, applied for
+          # as the company). Until then Windows builds are unsigned and
+          # SmartScreen will warn — known, accepted, and not a silent state:
+          echo "note: Windows artifacts are UNSIGNED until Azure Artifact Signing is approved."
+
+          if [ "$IS_TAG" = "true" ]; then
+            npm run release -- --${{ matrix.os == 'windows-latest' && 'win' || 'mac' }}
+          else
+            npm run ${{ matrix.script }}
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bipli-desktop-${{ matrix.os }}
+          path: |
+            dist/*.exe
+            dist/*.dmg
+            dist/*.zip
+            dist/latest*.yml
+          if-no-files-found: warn

@@ -117,89 +117,105 @@ window.addEventListener("load", async () => {
   console.log(`[spike-probe] Notification.permission=${Notification.permission} (popup path does not need it)`);
 });
 
-function reportRing(via, title, options) {
-  try {
-    // The app tags its incoming-call notification with the callSid (data.callSid,
-    // falling back to the tag). Carrying it through means the popup's Answer
-    // names the SAME call the app is ringing about, rather than "whatever is
-    // ringing" — which matters the moment a second call arrives.
-    const d = (options && options.data) || {};
-    ipcRenderer.send("spike:ring", {
-      via,
-      title,
-      body: options && options.body,
-      callSid: d.callSid || (options && options.tag) || null,
-    });
-  } catch {}
-}
+// =============================================================================
+// THE DESKTOP BRIDGE — window.bipliDesktop, which the web app calls on purpose.
+//
+// 🔴 THIS REPLACES A MONKEY-PATCH, and the patch is DELETED rather than kept as
+// a fallback. The shell used to learn about a ring by overwriting
+// ServiceWorkerRegistration.prototype.showNotification and watching what went
+// past. It worked — and it was a dependency on a shape this repo does not own,
+// whose failure mode was a silently un-ringing phone. The web repo's
+// client/src/lib/desktop-bridge.ts now calls these directly.
+//
+// ⚠️ KEEPING BOTH WOULD HAVE BEEN WORSE THAN EITHER: two ring sources means
+// double popups when both fire, and an unfalsifiable question about which one
+// is live when neither does.
+// =============================================================================
+const actionHandlers = new Set();
 
-// (a) Service-worker notifications — the path the app actually uses, and the
-//     only one that can carry Answer/Decline actions.
-if (typeof ServiceWorkerRegistration !== "undefined" && ServiceWorkerRegistration.prototype.showNotification) {
-  const orig = ServiceWorkerRegistration.prototype.showNotification;
-  ServiceWorkerRegistration.prototype.showNotification = function (title, options) {
-    reportRing("sw.showNotification", title, options);
-    return orig.apply(this, arguments);
-  };
-}
-
-// (b) Page-level `new Notification(...)`, in case any path still uses it. Both
-//     are hooked because a missed ring is worse than a duplicate log line, and
-//     the main process de-duplicates by state anyway.
-if (typeof window.Notification === "function") {
-  const OrigNotification = window.Notification;
-  const Wrapped = function (title, options) {
-    reportRing("new Notification", title, options);
-    return new OrigNotification(title, options);
-  };
-  Wrapped.prototype = OrigNotification.prototype;
-  Object.defineProperty(Wrapped, "permission", { get: () => OrigNotification.permission });
-  Wrapped.requestPermission = (...a) => OrigNotification.requestPermission(...a);
-  window.Notification = Wrapped;
-}
-
-// Ring end / answered. The softphone puts the call state in the document title
-// ("On a call", "Incoming call…"), which is a weak signal — hence spike-grade.
-// Watching it is enough to prove the tray state machine works; the durable
-// version gets an explicit event.
-const titleEl = document.querySelector("title");
-if (titleEl) {
-  new MutationObserver(() => {
-    const t = (document.title || "").toLowerCase();
-    if (t.includes("on a call") || t.includes("in call")) {
-      ipcRenderer.send("spike:ring-ended", { via: "title", answered: true });
-    } else if (!t.includes("incoming")) {
+contextBridge.exposeInMainWorld("bipliDesktop", {
+  /** An incoming call is ringing. Told, not inferred. */
+  ring: (r) => {
+    try {
+      ipcRenderer.send("spike:ring", {
+        via: "bridge",
+        title: r && r.who,
+        body: r && r.line,
+        callSid: (r && r.callSid) || null,
+      });
+    } catch {}
+  },
+  callAnswered: () => {
+    try {
+      ipcRenderer.send("spike:ring-ended", { via: "bridge", answered: true });
+    } catch {}
+  },
+  callEnded: () => {
+    try {
       ipcRenderer.send("spike:call-ended", {});
+    } catch {}
+  },
+  /** Answer / Decline pressed in the shell's popup. */
+  onAction: (cb) => {
+    if (typeof cb === "function") actionHandlers.add(cb);
+  },
+});
+
+ipcRenderer.on("bipli:notification-action", (_e, { action, callSid }) => {
+  // Hand it to the web app's own handler. No synthetic MessageEvent, no
+  // pretending to be the service worker — the app registered for this.
+  if (actionHandlers.size === 0) {
+    console.log(
+      "[spike-probe] 🔴 popup action with NO handler registered — the web app's bridge did not attach",
+    );
+    return;
+  }
+  for (const cb of actionHandlers) {
+    try {
+      cb({ action, callSid: callSid || null });
+    } catch (e) {
+      console.log(`[spike-probe] popup action handler threw: ${e && e.message}`);
     }
-  }).observe(titleEl, { childList: true });
-}
+  }
+});
 
 // =============================================================================
-// POPUP → APP. Answer / Decline from our own window, delivered on the contract
-// the app ALREADY has.
+// RELOAD WATCH — a shell that never quits also never reloads.
 //
-// 🔑 notifications.ts exports onNotificationAction(), which listens for
-// `{ type: "notification-action", callSid, action }` posted on the service-worker
-// message channel — the path a toast's action buttons take. Replaying that exact
-// message means the popup answers a call through the app's own wired handler,
-// not through a second mechanism that could drift from it. Nothing in the main
-// repo changes.
+// loadURL happens once at launch, so a Republish does not reach a running
+// client: it can hold a months-old bundle while every browser user is current,
+// and that cohort is exactly the one promised the app will never be closed.
 //
-// ⚠️ SAME SPIKE-GRADE CAVEAT AS THE RING HOOK, and for the same reason: this
-// depends on a message shape it does not own, and its failure mode is a button
-// that silently does nothing. The durable version is an explicit bridge the web
-// app exposes. Ship that before this ships.
+// ⚠️ THE MAIN PROCESS DECIDES WHETHER TO ACT, not this side. It owns the call
+// state, and a renderer cannot be trusted to judge whether it is safe to destroy
+// itself. All this does is report what the server said.
 // =============================================================================
-ipcRenderer.on("bipli:notification-action", (_e, { action, callSid }) => {
-  const msg = { type: "notification-action", callSid: callSid || "", action };
+const VERSION_POLL_MS = 5 * 60 * 1000;
+let knownBuild = null;
+
+async function checkVersion() {
   try {
-    if (navigator.serviceWorker) {
-      navigator.serviceWorker.dispatchEvent(new MessageEvent("message", { data: msg }));
-      console.log(`[spike-probe] delivered ${action} for ${callSid || "<no sid>"}`);
-    } else {
-      console.log("[spike-probe] 🔴 no serviceWorker container — cannot deliver popup action");
+    const res = await fetch("/api/version", { cache: "no-store", credentials: "include" });
+    if (!res.ok) return;
+    const { commit } = await res.json();
+    // "unknown" means the server could not read its own bundle hash. Treating
+    // that as a new build would reload on every poll.
+    if (!commit || commit === "unknown") return;
+    if (knownBuild === null) {
+      knownBuild = commit;
+      console.log(`[spike-probe] build ${commit}`);
+      return;
     }
-  } catch (e) {
-    console.log(`[spike-probe] 🔴 popup action delivery failed: ${e && e.message}`);
+    if (commit !== knownBuild) {
+      console.log(`[spike-probe] new build ${commit} (was ${knownBuild})`);
+      knownBuild = commit;
+      ipcRenderer.send("shell:build-changed", { commit });
+    }
+  } catch {
+    /* offline or mid-deploy; the next tick asks again */
   }
+}
+window.addEventListener("load", () => {
+  void checkVersion();
+  setInterval(() => void checkVersion(), VERSION_POLL_MS);
 });
