@@ -43,14 +43,44 @@ jobs:
           cache: npm
       - run: npm ci
 
-      # --- macOS signing + notarisation ------------------------------------
-      # Present only when the secrets are set. electron-builder reads all of
-      # these from the environment; there is nothing to pass on the command line.
-      - name: Import Developer ID certificate
-        if: matrix.os == 'macos-latest' && env.MAC_CERT_P12 != ''
+      # --- macOS notarisation key ------------------------------------------
+      # 🔑 electron-builder WANTS A PATH, NOT A KEY. APPLE_API_KEY is read as a
+      # filename and handed to notarytool; a secret pasted in as base64 (or as
+      # the PEM text itself) makes it try to open that blob as a path. The secret
+      # has to become a real file on disk before the build starts.
+      #
+      # ⚠️ RUNNER_TEMP, NOT THE WORKSPACE. The .p8 is a live Apple credential and
+      # the workspace is what upload-artifact publishes.
+      - name: Stage App Store Connect API key
+        if: matrix.os == 'macos-latest'
         env:
-          MAC_CERT_P12: ${{ secrets.MAC_CERT_P12 }}
-        run: echo "certificate present"
+          APPLE_API_KEY_B64: ${{ secrets.APPLE_API_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${APPLE_API_KEY_B64:-}" ]; then
+            echo "note: APPLE_API_KEY is not set — this build will not be notarised."
+            exit 0
+          fi
+          KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
+          # Tolerate either storage form: base64 (what `base64 -w0 key.p8`
+          # produces) or the PEM text pasted in whole.
+          # ⚠️ openssl, not base64(1). This runs on macOS, whose BSD base64 spells
+          # decode -D and does not accept --decode at all.
+          if printf '%s' "$APPLE_API_KEY_B64" | grep -q "BEGIN PRIVATE KEY"; then
+            printf '%s' "$APPLE_API_KEY_B64" > "$KEY_PATH"
+          else
+            printf '%s' "$APPLE_API_KEY_B64" | tr -d '[:space:]' | openssl base64 -d -A > "$KEY_PATH"
+          fi
+          chmod 600 "$KEY_PATH"
+          # Prove it decoded to a key rather than to noise, before the build
+          # spends ten minutes getting to notarisation and failing there.
+          grep -q "BEGIN PRIVATE KEY" "$KEY_PATH" || {
+            echo "::error::APPLE_API_KEY did not decode to a PKCS#8 private key."
+            exit 1
+          }
+          echo "APPLE_API_KEY=$KEY_PATH" >> "$GITHUB_ENV"
+          echo "staged $(wc -c < "$KEY_PATH") byte key at $KEY_PATH"
 
       - name: Build
         env:
@@ -61,7 +91,13 @@ jobs:
           CSC_KEY_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
           # Notarisation via an App Store Connect API key (no app-specific
           # password, no 2FA prompt in CI).
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_PATH }}
+          # 🔴 APPLE_API_KEY IS DELIBERATELY ABSENT HERE. It read
+          # secrets.APPLE_API_KEY_PATH, a secret that does not exist, so it
+          # resolved to "" — and an empty env var reads to electron-builder as
+          # unset: "Env vars APPLE_API_KEY, APPLE_API_KEY_ID and APPLE_API_ISSUER
+          # need to be set". The staging step above puts the PATH in GITHUB_ENV;
+          # naming it here again would override that with the empty value, since
+          # step-level env beats job-level env.
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -80,6 +116,20 @@ jobs:
             exit 1
           fi
 
+          # 🔴 SIGNED BUT UN-NOTARISED IS ALSO NOT A RELEASE. Gatekeeper refuses
+          # it on any Mac that has not seen it before, and the failure looks
+          # identical to an unsigned build to the person downloading it. Checked
+          # here rather than discovered ten minutes into the build.
+          if [ "${{ matrix.os }}" = "macos-latest" ] && [ "$IS_TAG" = "true" ]; then
+            for v in APPLE_API_KEY APPLE_API_KEY_ID APPLE_API_ISSUER APPLE_TEAM_ID; do
+              if [ -z "${!v:-}" ]; then
+                echo "::error::Tagged macOS release with $v unset — the DMG would be signed but not notarised."
+                exit 1
+              fi
+            done
+            [ -f "$APPLE_API_KEY" ] || { echo "::error::APPLE_API_KEY=$APPLE_API_KEY is not a file. electron-builder expects a PATH to the .p8."; exit 1; }
+          fi
+
           # Windows signing is a follow-up (Azure Artifact Signing, applied for
           # as the company). Until then Windows builds are unsigned and
           # SmartScreen will warn — known, accepted, and not a silent state:
@@ -90,6 +140,13 @@ jobs:
           else
             npm run ${{ matrix.script }}
           fi
+
+      # The key is a live credential; the runner is ephemeral but the artifact
+      # step is not selective, so remove it explicitly either way.
+      - name: Remove staged API key
+        if: always() && matrix.os == 'macos-latest'
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/AuthKey.p8"
 
       - uses: actions/upload-artifact@v7
         with:
