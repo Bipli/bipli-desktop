@@ -30,8 +30,19 @@ import path from "node:path";
 //   Windows → the full app icon, the same one on the taskbar. It carries its own
 //             background, so it does not depend on the taskbar's colour.
 //   macOS   → the monochrome silhouette, which becomes a template image.
-const WIN_SRC = process.argv[2] ?? "/home/samuel/bipli-mobile/assets/icon.png";
-const MAC_SRC = process.argv[3] ?? "/home/samuel/bipli-mobile/assets/adaptive-icon-monochrome.png";
+// 🔑 THE BRAND SOURCE IS VENDORED, NOT READ OUT OF A SIBLING CHECKOUT. These
+// used to point at absolute paths inside ../bipli-mobile, which made this script
+// depend on one machine's layout AND on files that repo generates — when mobile
+// regenerated its own icons from this same mark, both paths silently became the
+// wrong picture and re-running here would have quietly changed the tray.
+const WIN_SRC = process.argv[2] ?? path.resolve(import.meta.dirname, "..", "assets", "brand-icon-source.png");
+const MAC_SRC = process.argv[3] ?? path.resolve(import.meta.dirname, "..", "assets", "brand-mono-source.png");
+// 🔑 THE APP ICON USES A DIFFERENT SOURCE TO THE TRAY, ON PURPOSE. The tray reads
+// the 512px framed icon, whose inner tile is only 320px — plenty for a 16px tray
+// icon, and changing it would move pixels in icons that are already right. The
+// 1024px foreground carries the SAME tile at 536px, which is what a 1024px app
+// icon should be built from: a 1.9x grow instead of a 3.2x one.
+const TILE_SRC = path.resolve(import.meta.dirname, "..", "assets", "brand-tile-source.png");
 const OUT = path.resolve(import.meta.dirname, "..", "assets");
 
 // --- PNG decode (8-bit RGBA only; the source is verified to be that) --------
@@ -159,6 +170,37 @@ function resize({ w, h, rgba }, tw, th) {
   return { w: tw, h: th, rgba: out };
 }
 
+
+/**
+ * Bilinear GROW, premultiplied.
+ *
+ * 🔑 NOT resize(). That one averages the source pixels covered by each
+ * destination pixel — correct for shrinking, which is all the tray ever does,
+ * but when growing, the covered area is a single pixel and it silently
+ * degenerates to nearest-neighbour. Invisible at 16px; at the 1.9x the 1024 app
+ * icon needs, it is visibly blocky. Premultiplied so the tile's transparent
+ * rounded corners cannot bleed their colour into the edge.
+ */
+function upscale({ w, h, rgba }, size) {
+  const out = Buffer.alloc(size * size * 4);
+  for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+    const fx = ((x + 0.5) * w) / size - 0.5, fy = ((y + 0.5) * h) / size - 0.5;
+    const x0 = Math.floor(fx), y0 = Math.floor(fy), tx = fx - x0, ty = fy - y0;
+    let r = 0, g = 0, b = 0, a = 0;
+    for (const [dx, dy, wt] of [[0, 0, (1 - tx) * (1 - ty)], [1, 0, tx * (1 - ty)], [0, 1, (1 - tx) * ty], [1, 1, tx * ty]]) {
+      const sx = Math.min(w - 1, Math.max(0, x0 + dx)), sy = Math.min(h - 1, Math.max(0, y0 + dy));
+      const i = (sy * w + sx) * 4, al = rgba[i + 3] / 255;
+      r += rgba[i] * al * wt; g += rgba[i + 1] * al * wt; b += rgba[i + 2] * al * wt; a += rgba[i + 3] * wt;
+    }
+    const o = (y * size + x) * 4;
+    out[o + 3] = Math.round(a);
+    const un = a > 0 ? 255 / a : 0;
+    out[o] = Math.min(255, Math.round(r * un));
+    out[o + 1] = Math.min(255, Math.round(g * un));
+    out[o + 2] = Math.min(255, Math.round(b * un));
+  }
+  return { w: size, h: size, rgba: out };
+}
 
 /**
  * Crop the app icon down to its INNER dark tile.
@@ -309,13 +351,26 @@ for (const [size, suffix] of [[16, ""], [32, "@2x"]]) {
   write(`tray-ringing-mac${suffix}`, dot(mac, RINGING));
   write(`tray-incall-mac${suffix}`, dot(mac, INCALL));
 }
-// 🔑 THE APP ICON HAS THE SAME DEFECT AND THE SAME FIX. build/icon.png feeds the
-// installer, the Start Menu entry and the macOS bundle, and it was a straight
-// copy of the cream-framed source — so every one of those showed a tile in a
-// tile too. Written from the cropped tile, which is 320px: above
-// electron-builder's 256 minimum, and honest pixels rather than an upscale.
+// 🔑 THE APP ICON IS COMPOSED AT 1024, NOT SHIPPED AS THE RAW CROP. build/icon.png
+// feeds the installer, the Start Menu entry and the macOS bundle. It used to be
+// written straight from the cropped tile at whatever size that landed on — 320px
+// from the old 512px source — with a comment claiming that cleared
+// electron-builder's minimum. It did not: macOS needs at least 512 and the mac
+// job failed with "Icon must be at least 512x512 pixels, provided: 320x320".
+// Sized from the same 536px tile the mobile icons use, so all three apps compose
+// one mark from one source.
+//
+// ⚠️ THE ROUNDED CORNERS ARE KEPT HERE AND DISCARDED ON iOS, and that is not an
+// inconsistency. iOS rejects alpha outright and masks the icon itself, so corners
+// baked into the art would draw a dark ring inside Apple's rounding. macOS and
+// Windows apply NO mask — a full-bleed square would sit in the Dock as the one
+// hard-edged icon among rounded neighbours. Same mark, opposite handling,
+// because the platforms disagree about who rounds it.
+const APP_ICON = 1024;
 const BUILD_ICON = path.resolve(import.meta.dirname, "..", "build", "icon.png");
 fs.mkdirSync(path.dirname(BUILD_ICON), { recursive: true });
-writePng(BUILD_ICON, winSrc.w, winSrc.h, winSrc.rgba);
+const appIcon = upscale(cropToAlpha(readPng(TILE_SRC)), APP_ICON);
+writePng(BUILD_ICON, appIcon.w, appIcon.h, appIcon.rgba);
+if (appIcon.w < 512) throw new Error(`app icon ${appIcon.w}px is below the 512 macOS floor`);
 console.log(`wrote ${made.length} tray icons to ${OUT}`);
-console.log(`wrote app icon ${winSrc.w}x${winSrc.h} to ${BUILD_ICON}`);
+console.log(`wrote app icon ${appIcon.w}x${appIcon.h} to ${BUILD_ICON}`);
