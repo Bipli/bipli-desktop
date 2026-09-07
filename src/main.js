@@ -21,8 +21,9 @@
 // is a finding rather than something to work around.
 // =============================================================================
 
-const { app, BrowserWindow, Tray, Menu, session, ipcMain, powerSaveBlocker, nativeImage } = require("electron");
+const { app, BrowserWindow, Tray, Menu, session, ipcMain, powerSaveBlocker, nativeImage, shell } = require("electron");
 const path = require("path");
+const { shouldShowOffline } = require("./load-failure");
 
 const BIPLI_URL = process.env.BIPLI_URL || "https://bipli.com";
 const SHELL_VERSION = require("../package.json").version;
@@ -75,8 +76,105 @@ if (!app.requestSingleInstanceLock()) {
   });
 }
 
+// =============================================================================
+// LOGGING TO A FILE THE CUSTOMER CAN SEND
+//
+// 🔴 console.log IS INVISIBLE IN A PACKAGED APP. Every diagnostic this shell
+// prints — the bridge check, load failures, device probes — went to a terminal
+// nobody has. Jordan's first install opened a blank window and there was nothing
+// to ask him for. Everything now also lands in userData/bipli.log, and "Show
+// log" in the tray opens it.
+//
+// ⚠️ NO SECRETS ARE LOGGED, and nothing here may start doing so. The shell never
+// sees a password or a token: it loads a URL and relays call events. Keep it
+// that way — this file is meant to be emailed to us by a customer.
+// =============================================================================
+const fs = require("fs");
+const LOG_MAX_BYTES = 512 * 1024;
+let logPath = null;
+let logWarned = false;
+
+function logFilePath() {
+  if (logPath) return logPath;
+  try {
+    logPath = path.join(app.getPath("userData"), "bipli.log");
+  } catch {
+    // getPath throws before app is ready; the caller falls back to console.
+    return null;
+  }
+  return logPath;
+}
+
 function log(...args) {
-  console.log(`[spike ${new Date().toISOString().slice(11, 19)}]`, ...args);
+  const line = `[bipli ${new Date().toISOString()}] ${args
+    .map((a) => (typeof a === "string" ? a : JSON.stringify(a)))
+    .join(" ")}`;
+  console.log(line);
+  const p = logFilePath();
+  if (!p) return;
+  try {
+    // Rotate rather than grow without limit: one previous file is enough to
+    // cover "it broke, I restarted it, then it broke again".
+    try {
+      if (fs.statSync(p).size > LOG_MAX_BYTES) fs.renameSync(p, `${p}.1`);
+    } catch { /* no file yet */ }
+    fs.appendFileSync(p, line + "\n");
+  } catch (e) {
+    // A logger that crashes the app it is diagnosing is worse than no logger.
+    if (!logWarned) {
+      logWarned = true;
+      console.log(`[bipli] could not write ${p}: ${e && e.message}`);
+    }
+  }
+}
+
+// =============================================================================
+// LOADING THE APP, AND FAILING VISIBLY WHEN IT WILL NOT LOAD
+//
+// 🔴 JORDAN'S FIRST INSTALL OPENED A BLANK WHITE WINDOW. did-fail-load was
+// handled by logging to a console nobody could see, and the window was left
+// showing whatever it had — nothing. A shell that cannot reach its own site has
+// exactly one job: say so, and offer to try again.
+//
+// ⚠️ THE WATCHDOG EXISTS BECAUSE did-fail-load IS NOT THE ONLY WAY TO FAIL. A
+// captive portal that accepts the connection and never answers, or DNS that
+// hangs, produces no event at all — the window just sits there. Silence is the
+// failure mode a blank window is made of, so it is timed.
+// =============================================================================
+const TRAY_IDLE_TOOLTIP = "Bipli — right-click for Reload and Show log";
+const LOAD_TIMEOUT_MS = 20000;
+let loadWatchdog = null;
+let showingOffline = false;
+
+function clearLoadWatchdog() {
+  if (loadWatchdog) {
+    clearTimeout(loadWatchdog);
+    loadWatchdog = null;
+  }
+}
+
+function loadApp() {
+  showingOffline = false;
+  clearLoadWatchdog();
+  log(`loading ${BIPLI_URL}`);
+  loadWatchdog = setTimeout(() => {
+    // Reached only if neither did-finish-load nor did-fail-load ever fired.
+    log(`LOAD TIMEOUT after ${LOAD_TIMEOUT_MS}ms — no response from ${BIPLI_URL}`);
+    showOffline(`no response after ${LOAD_TIMEOUT_MS / 1000}s`);
+  }, LOAD_TIMEOUT_MS);
+  win.loadURL(BIPLI_URL).catch((e) => log(`loadURL rejected: ${e && e.message}`));
+}
+
+function showOffline(reason) {
+  clearLoadWatchdog();
+  if (showingOffline) return; // one failure, one screen
+  showingOffline = true;
+  log(`showing offline screen (${reason})`);
+  // The reason rides in the hash so the page needs no preload and no IPC to
+  // render it — one less thing that can be broken at the moment it is needed.
+  win.loadFile(path.join(__dirname, "offline.html"), { hash: encodeURIComponent(reason) })
+    .catch((e) => log(`could not show offline screen: ${e && e.message}`));
+  if (!win.isVisible()) win.show();
 }
 
 function createWindow() {
@@ -196,10 +294,21 @@ function createWindow() {
     `${win.webContents.getUserAgent()} BipliDesktop/${SHELL_VERSION}`,
   );
 
-  win.loadURL(BIPLI_URL);
-  win.webContents.on("did-fail-load", (_e, code, desc) => log(`LOAD FAILED ${code} ${desc}`));
+  loadApp();
+  win.webContents.on("did-fail-load", (_e, code, desc, url, isMainFrame) => {
+    log(`LOAD FAILED ${code} ${desc} url=${url} mainFrame=${isMainFrame}`);
+    // ⚠️ MAIN FRAME ONLY, AND NEVER ON -3. A failed image or an analytics
+    // beacon fires this too, and replacing the whole app because a favicon 404d
+    // would be a worse bug than the one being fixed. -3 is ERR_ABORTED, which
+    // is what a NORMAL navigation looks like when the page navigates away
+    // mid-load — treating it as an error would throw people out of the app
+    // while they use it.
+    if (!shouldShowOffline(code, isMainFrame)) return;
+    showOffline(`${code} ${desc}`);
+  });
   win.webContents.on("did-finish-load", () => {
-    log(`loaded ${BIPLI_URL}`);
+    clearLoadWatchdog();
+    log(`loaded ${win.webContents.getURL()}`);
     // 🔴 VERIFY THE BRIDGE, DO NOT ASSUME IT. Its absence is silent by nature —
     // no popup, no Answer, no reload watch, and no error anyone sees. This is
     // the check that would have caught the missing import on the first run
@@ -278,12 +387,16 @@ let callState = "idle";
 function setCallState(next, detail) {
   if (callState === next) return;
   callState = next;
+  // ⚠️ IDLE KEEPS THE DISCOVERY HINT. This runs on every call-state change and
+  // used to reset the tooltip to a bare "Bipli", quietly undoing the hint set at
+  // tray creation — so the help would disappear after the user's first call and
+  // never come back. During a call the state is the more useful thing to say.
   const label =
     next === "ringing"
       ? `Bipli. Incoming call${detail ? `: ${detail}` : ""}`
       : next === "in-call"
         ? "Bipli. On a call"
-        : "Bipli";
+        : TRAY_IDLE_TOOLTIP;
   try {
     tray.setImage(trayIcon(next));
     tray.setToolTip(label);
@@ -496,6 +609,11 @@ ipcMain.on("ring:respond", (_e, { action }) => {
 let pendingReloadBuild = null;
 let bridgeAttached = false;
 
+ipcMain.on("shell:retry-load", () => {
+  log("retry requested from the offline screen");
+  loadApp();
+});
+
 ipcMain.on("shell:bridge-attached", (_e, { version }) => {
   bridgeAttached = true;
   log(`bridge attached (shell ${version})`);
@@ -574,6 +692,27 @@ function buildTrayMenu() {
         enabled: callState === "idle",
         click: () => reloadNow(),
       },
+      {
+        // 🔑 THE ONLY WAY A CUSTOMER CAN HAND US EVIDENCE. Opens the log in
+        // whatever the OS uses for .log files. Deliberately not "Copy
+        // diagnostics" or an upload: opening a file is a thing people already
+        // know how to do, and it shows them exactly what they are sending us.
+        label: "Show log",
+        click: async () => {
+          const p = logFilePath();
+          if (!p) return;
+          try {
+            // Ensure the file exists — nothing is more confusing than a menu
+            // item that appears to do nothing on a fresh install.
+            if (!fs.existsSync(p)) fs.writeFileSync(p, "");
+            // showItemInFolder, not openPath: a .log has no default handler on
+            // many Windows machines, and openPath would silently do nothing.
+            shell.showItemInFolder(p);
+          } catch (e) {
+            log(`could not reveal log: ${e && e.message}`);
+          }
+        },
+      },
       { type: "separator" },
       {
         label: "Quit Bipli",
@@ -588,7 +727,11 @@ function buildTrayMenu() {
 
 function createTray() {
   tray = new Tray(trayIcon("idle"));
-  tray.setToolTip("Bipli");
+  // ⚠️ THE TOOLTIP IS THE DISCOVERY PATH WHEN THE WINDOW IS BLANK. If the app
+  // failed to load, the tray icon is the only Bipli affordance on screen and its
+  // menu is not obvious — say what it is for, in the one place the OS will show
+  // without a click.
+  tray.setToolTip(TRAY_IDLE_TOOLTIP);
   buildTrayMenu();
   tray.on("click", () => (win.isVisible() ? win.hide() : win.show()));
 }

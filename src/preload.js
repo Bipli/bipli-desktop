@@ -172,6 +172,15 @@ contextBridge.exposeInMainWorld("bipliDesktop", {
   onAction: (cb) => {
     if (typeof cb === "function") actionHandlers.add(cb);
   },
+  /**
+   * Retry loading the app. Used by the shell's own offline screen; harmless on
+   * bipli.com, which never calls it.
+   */
+  retryLoad: () => {
+    try {
+      ipcRenderer.send("shell:retry-load");
+    } catch {}
+  },
   /** Version string, so the page can say what it is running inside. */
   version: SHELL_VERSION,
 });

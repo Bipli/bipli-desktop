@@ -6,6 +6,7 @@
   "main": "src/main.js",
   "scripts": {
     "spike": "electron .",
+    "check:load-failure": "node scripts/check-load-failure.js",
     "pack:win": "electron-builder --win --x64 --publish never",
     "pack:mac": "electron-builder --mac --publish never",
     "release": "electron-builder --publish always"
