@@ -315,8 +315,29 @@ No Australian Azure region hosts the signing resource, so the account lives
 elsewhere. That is build artefacts rather than customer data, so it does not
 touch the data-residency position — worth recording, not worth blocking on.
 
+## Verified on real hardware
+
+✅ **The popup's Answer connects — Windows, 6 Sep 2026.** Call answered from the
+popup, audio both ways. This was the single most important open question, because
+Answer travels back on the app's own notification-action contract rather than a
+second mechanism of our own: it replays
+`{ type: "notification-action", callSid, action }` on the service-worker message
+channel, the same path a toast's buttons would take. A button that silently does
+nothing was the plausible failure, and it is now ruled out on the platform where
+the whole notification story failed hardest.
+
+✅ **The hidden-window premise**, measured at ±15ms across 25+ minutes of both
+minimise and close-hide (see above).
+
 ## Still unproven
 
-Honest list, kept current: whether the popup's **Answer actually connects** on
-every platform, and whether `tel:` registration survives a real install on
-Windows. Both need a machine this repo has never been built on.
+Kept current, and deliberately short.
+
+- **`tel:` registration on a real Windows install.** Everything about it is the
+  kind of thing that succeeds in code and does nothing in practice:
+  `setAsDefaultProtocolClient` returns `true` regardless, and the `Capabilities`
+  registry entries decide whether Bipli even appears in the Default apps chooser.
+  Install, click a number in a browser, and read the two log lines it now writes.
+- **Answer on macOS.** The code path is the same one Windows proved, so this is a
+  low-risk gap rather than an open question — but it has not been witnessed, and
+  "same code path" is how the popup's minimised bug survived a round.
