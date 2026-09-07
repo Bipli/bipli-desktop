@@ -24,6 +24,7 @@
 const { app, BrowserWindow, Tray, Menu, session, ipcMain, powerSaveBlocker, nativeImage, shell } = require("electron");
 const path = require("path");
 const { shouldShowOffline } = require("./load-failure");
+const { telUrlToNumber, telFromArgv } = require("./tel-url");
 
 const BIPLI_URL = process.env.BIPLI_URL || "https://bipli.com";
 const SHELL_VERSION = require("../package.json").version;
@@ -65,16 +66,61 @@ app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
 // `npm run spike`. Must match electron-builder's appId.
 app.setAppUserModelId("com.bipli.desktop");
 
+// =============================================================================
+// tel: HANDLING — clicking a number anywhere on the machine dials it in Bipli.
+//
+// 🔑 IT PRE-FILLS, IT DOES NOT DIAL. The number lands in the dialler, focused,
+// one tap from calling. An OS-wide handler that places a call the instant
+// something emits a tel: URL would put an accidental click straight through to a
+// customer.
+//
+// It terminates at /dial?to=, the click-to-call route the web app already has
+// (Finding #39, built for Zoho): it parses leniently, falls back to the raw
+// string so a bad number is visible rather than silently dropped, and stashes
+// itself through a logged-out landing. Reusing it means the desktop handler and
+// the CRM hand-off cannot drift apart.
+//
+// ⚠️ REGISTRATION IS A REQUEST, NOT A FACT — see registerTelHandler().
+// =============================================================================
+let pendingTel = null;
+
+/** Send a number to the dialler, or hold it until the window exists. */
+function openInDialler(number) {
+  if (!number) return;
+  log(`tel: → dialler ${number}`);
+  if (!win) {
+    // Cold start: the URL arrives before the window does.
+    pendingTel = number;
+    return;
+  }
+  const url = `${BIPLI_URL.replace(/\/$/, "")}/dial?to=${encodeURIComponent(number)}`;
+  win.loadURL(url).catch((e) => log(`tel: navigation failed: ${e && e.message}`));
+  if (!win.isVisible()) win.show();
+  win.focus();
+}
+
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
-  app.on("second-instance", () => {
+  // Windows/Linux: a tel: click on an already-running app arrives as a second
+  // instance whose argv carries the URL.
+  app.on("second-instance", (_e, argv) => {
+    const n = telFromArgv(argv);
+    if (n) openInDialler(n);
     if (win) {
       win.show();
       win.focus();
     }
   });
 }
+
+// macOS delivers it as an event instead, and can do so BEFORE the app is ready.
+app.on("open-url", (event, url) => {
+  event.preventDefault();
+  const n = telUrlToNumber(url);
+  log(`open-url ${url} → ${n ?? "(not a tel: URL)"}`);
+  if (n) openInDialler(n);
+});
 
 // =============================================================================
 // LOGGING TO A FILE THE CUSTOMER CAN SEND
@@ -125,6 +171,44 @@ function log(...args) {
       logWarned = true;
       console.log(`[bipli] could not write ${p}: ${e && e.message}`);
     }
+  }
+}
+
+// =============================================================================
+// REGISTERING AS A tel: HANDLER
+//
+// 🔴 setAsDefaultProtocolClient RETURNS true WHEN NOTHING CHANGED. Neither OS
+// lets an app take a protocol default on its own:
+//
+//   Windows — the call writes HKCU\Software\Classes, which makes Bipli a
+//     CANDIDATE. The user still has to pick it in the "How do you want to open
+//     this?" chooser, or in Settings → Apps → Default apps → Choose defaults by
+//     link type → TEL. The installer writes the Capabilities/RegisteredApplications
+//     entries (build/installer.nsh) so Bipli APPEARS in that list at all.
+//   macOS — the real registration is CFBundleURLTypes in the bundle, which comes
+//     from the `protocols` block in package.json; the runtime call only asks
+//     LaunchServices to prefer us. macOS defaults tel: to FaceTime and prompts
+//     once.
+//
+// So the return value is worth nothing and the STATE is worth everything: log
+// what we asked for and what the OS says afterwards. Without that, "clicking a
+// number does nothing" is unanswerable — which is the same hole the blank window
+// left us in.
+// =============================================================================
+function registerTelHandler() {
+  try {
+    const asked = app.setAsDefaultProtocolClient("tel");
+    const isDefault = app.isDefaultProtocolClient("tel");
+    log(`tel: handler — setAsDefaultProtocolClient=${asked} isDefaultProtocolClient=${isDefault}`);
+    if (!isDefault) {
+      log(
+        "tel: Bipli is registered as a CANDIDATE but is not the default handler. " +
+          "The user must choose it once: Windows → Settings, Apps, Default apps, " +
+          "Choose defaults by link type, TEL. macOS → the prompt on the first tel: click.",
+      );
+    }
+  } catch (e) {
+    log(`tel: registration threw: ${e && e.message}`);
   }
 }
 
@@ -778,6 +862,12 @@ app.whenReady().then(() => {
   log(`powerSaveBlocker active=${powerSaveBlocker.isStarted(powerBlockerId)}`);
   createWindow();
   createTray();
+  registerTelHandler();
+  // Cold start on Windows: the URL that launched us is in our own argv.
+  const cold = telFromArgv(process.argv);
+  if (cold) openInDialler(cold);
+  else if (pendingTel) { const n = pendingTel; pendingTel = null; openInDialler(n); }
+
   // Build the ring popup NOW, hidden. On the ring we only call show() — no
   // construction, no page load, no waiting for a first paint the compositor may
   // never schedule while the app is in the background.

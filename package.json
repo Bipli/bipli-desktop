@@ -7,6 +7,7 @@
   "scripts": {
     "spike": "electron .",
     "check:load-failure": "node scripts/check-load-failure.js",
+    "check:tel": "node scripts/check-tel-url.js",
     "pack:win": "electron-builder --win --x64 --publish never",
     "pack:mac": "electron-builder --mac --publish never",
     "release": "electron-builder --publish always"
@@ -28,6 +29,14 @@
       "output": "dist",
       "buildResources": "build"
     },
+    "protocols": [
+      {
+        "name": "Phone call",
+        "schemes": [
+          "tel"
+        ]
+      }
+    ],
     "publish": [
       {
         "provider": "github",
