@@ -768,6 +768,18 @@ function initUpdater() {
 function buildTrayMenu() {
   tray.setContextMenu(
     Menu.buildFromTemplate([
+      // 🔑 WHICH BUILD AM I ON? Unanswerable until now. The shell auto-updates
+      // silently and has no About window, so a user reporting a bug could not
+      // tell us their version and we could not tell whether a fix had reached
+      // them. Disabled because it is a fact, not an action — a menu item that
+      // looks clickable and does nothing is worse than one that is plainly inert.
+      //
+      // ⚠️ app.getVersion(), not the SHELL_VERSION constant. That constant is
+      // read from package.json at require time; getVersion() is what the OS and
+      // the installer consider this app to be, which is the number worth quoting
+      // back to us in a bug report.
+      { label: `Bipli v${app.getVersion()}`, enabled: false },
+      { type: "separator" },
       { label: "Show Bipli", click: () => { win.show(); win.focus(); } },
       {
         label: pendingReloadBuild ? "Reload (update ready)" : "Reload",
