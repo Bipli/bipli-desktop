@@ -22,7 +22,42 @@ permissions:
   contents: write # electron-builder creates/updates the GitHub Release
 
 jobs:
+  # 🔴 THE DRAFT IS CREATED ONCE, HERE, BEFORE ANY BUILD STARTS. v0.1.0 produced
+  # TWO draft releases: both platform jobs ran electron-builder --publish always
+  # at the same moment, each looked for a release for the tag, each found none,
+  # and each created one. Whichever lost the race uploaded into a release nobody
+  # publishes. Creating the draft in a job the builds DEPEND ON removes the race
+  # entirely rather than narrowing it.
+  draft:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Idempotent: a re-run of a failed workflow must reuse the draft, not
+          # add another one.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists — reusing it"
+            exit 0
+          fi
+          gh release create "$TAG" --draft --title "$TAG" --notes "$(cat <<'NOTES'
+          Bipli Desktop.
+
+          macOS: one universal download for both Apple Silicon and Intel Macs.
+          Signed with our Apple Developer ID and notarised by Apple.
+          NOTES
+          )"
+
   build:
+    needs: [draft]
+    # The matrix must still run for a manual dry run, when `draft` is skipped.
+    if: always() && (needs.draft.result == 'success' || needs.draft.result == 'skipped')
     strategy:
       # ⚠️ fail-fast OFF. One platform failing must not cancel the other — a
       # half-finished release where you cannot see WHICH half failed is worse
@@ -201,7 +236,18 @@ jobs:
           # SmartScreen will warn — known, accepted, and not a silent state:
           echo "note: Windows artifacts are UNSIGNED until Azure Artifact Signing is approved."
 
-          if [ "$IS_TAG" = "true" ]; then
+          # 🔴 WINDOWS NEVER PUBLISHES WHILE IT IS UNSIGNED. An unsigned EXE
+          # sitting in a public release is one click from a SmartScreen
+          # "Windows protected your PC" full-page warning, which on a first
+          # download reads as malware. It still BUILDS on every tag — that is
+          # how we know it compiles — and lands as a workflow artifact for
+          # internal testing, but it is not a release asset until the repo
+          # variable WINDOWS_SIGNED is set to true alongside a real certificate.
+          WIN_SIGNED="${{ vars.WINDOWS_SIGNED == 'true' }}"
+          if [ "${{ matrix.os }}" = "windows-latest" ] && [ "$WIN_SIGNED" != "true" ]; then
+            echo "note: Windows is UNSIGNED — building for the artifact only, not publishing to the release."
+            npm run pack:win
+          elif [ "$IS_TAG" = "true" ]; then
             npm run release -- --${{ matrix.os == 'windows-latest' && 'win' || 'mac' }}
           else
             npm run ${{ matrix.script }}
@@ -225,3 +271,31 @@ jobs:
             dist/*.zip
             dist/latest*.yml
           if-no-files-found: warn
+
+  # One release, published once, after both platforms have finished uploading
+  # into it. Splitting publish from build is what makes "exactly one release"
+  # true even if a platform job is re-run.
+  publish:
+    needs: [build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 🔴 A macOS RELEASE WITHOUT A ZIP CANNOT AUTO-UPDATE. electron-updater
+          # asks for a .zip and explicitly excludes dmg and pkg
+          # (MacUpdater: findFile(files, "zip", ["pkg", "dmg"])), so a
+          # DMG-only release installs fine and then never updates again. Refuse
+          # to publish one rather than discover it a version later.
+          assets=$(gh release view "$TAG" --json assets --jq '.assets[].name')
+          echo "$assets"
+          echo "$assets" | grep -q '\.zip$'   || { echo "::error::No macOS .zip in $TAG — electron-updater cannot update from a DMG-only release."; exit 1; }
+          echo "$assets" | grep -q 'latest-mac.yml' || { echo "::error::No latest-mac.yml in $TAG — nothing to update from."; exit 1; }
+          gh release edit "$TAG" --draft=false
+          echo "published $TAG"
