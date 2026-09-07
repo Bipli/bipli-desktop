@@ -4,3 +4,18 @@ out/
 *.log
 build/*.p12
 *.pem
+
+# Signing material must never be committable, whatever it is called. The repo is
+# going PUBLIC, so a mistaken `git add` here is a disclosure rather than an
+# embarrassment — these patterns are the cheap half of preventing that.
+*.p8
+*.p12
+*.mobileprovision
+*.keychain
+*.keychain-db
+AuthKey_*
+*.key
+developerID.*
+.env
+.env.*
+*.base64
