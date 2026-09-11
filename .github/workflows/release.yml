@@ -8,8 +8,9 @@
 # missing on a tagged run.
 #
 # Triggers:
-#   push tag v*  → build both, sign where credentials exist, publish a Release
-#   manual       → build both, publish nothing (a dry run that proves it compiles)
+#   push tag v*  → build both, sign both, verify both, publish a Release
+#   manual       → build both, sign where credentials exist, publish nothing
+#                  (a dry run that proves it compiles AND signs)
 # =============================================================================
 name: release
 
@@ -51,6 +52,8 @@ jobs:
 
           macOS: one universal download for both Apple Silicon and Intel Macs.
           Signed with our Apple Developer ID and notarised by Apple.
+
+          Windows: Bipli-Setup-<version>.exe, signed with Azure Trusted Signing.
           NOTES
           )"
 
@@ -202,11 +205,25 @@ jobs:
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # --- Windows: Azure Trusted Signing -------------------------------
+          # 🔑 THE SIGN HOOK IS electron-builder's OWN. win.azureSignOptions in
+          # package.json makes electron-builder call Invoke-TrustedSigning (the
+          # TrustedSigning PowerShell module, the same tool the
+          # azure/trusted-signing-action wraps) on EVERY binary it produces: the
+          # app's Bipli.exe, the NSIS uninstaller, and the installer. A post-
+          # build action could only reach the installer sitting in dist/, and
+          # would leave the app and uninstaller inside it unsigned. Auth is the
+          # module's EnvironmentCredential: these three variables, nothing else.
+          # Service principal bipli-signing-ci, role Certificate Profile Signer.
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
         shell: bash
         run: |
           set -euo pipefail
           IS_TAG="${{ startsWith(github.ref, 'refs/tags/v') }}"
           HAS_MAC_CERT="${{ secrets.MAC_CERT_P12 != '' }}"
+          HAS_AZURE="${{ secrets.AZURE_CLIENT_SECRET != '' && secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_TENANT_ID != '' }}"
 
           # 🔴 A TAGGED MAC BUILD WITHOUT CREDENTIALS MUST FAIL, NOT SHIP.
           # An unsigned DMG installs and then Gatekeeper refuses to open it — a
@@ -231,27 +248,68 @@ jobs:
             [ -f "$APPLE_API_KEY" ] || { echo "::error::APPLE_API_KEY=$APPLE_API_KEY is not a file. electron-builder expects a PATH to the .p8."; exit 1; }
           fi
 
-          # Windows signing is a follow-up (Azure Artifact Signing, applied for
-          # as the company). Until then Windows builds are unsigned and
-          # SmartScreen will warn — known, accepted, and not a silent state:
-          echo "note: Windows artifacts are UNSIGNED until Azure Artifact Signing is approved."
-
           # 🔴 WINDOWS NEVER PUBLISHES WHILE IT IS UNSIGNED. An unsigned EXE
           # sitting in a public release is one click from a SmartScreen
           # "Windows protected your PC" full-page warning, which on a first
-          # download reads as malware. It still BUILDS on every tag — that is
-          # how we know it compiles — and lands as a workflow artifact for
-          # internal testing, but it is not a release asset until the repo
-          # variable WINDOWS_SIGNED is set to true alongside a real certificate.
+          # download reads as malware. The repo variable WINDOWS_SIGNED is the
+          # deliberate act that lets Windows into the release; the Azure
+          # secrets are what make it true. A tagged run with the variable set
+          # and no secrets is a misconfiguration and fails here, not after ten
+          # minutes of building.
           WIN_SIGNED="${{ vars.WINDOWS_SIGNED == 'true' }}"
-          if [ "${{ matrix.os }}" = "windows-latest" ] && [ "$WIN_SIGNED" != "true" ]; then
-            echo "note: Windows is UNSIGNED — building for the artifact only, not publishing to the release."
+          if [ "${{ matrix.os }}" = "windows-latest" ] && [ "$IS_TAG" = "true" ] && [ "$WIN_SIGNED" = "true" ] && [ "$HAS_AZURE" != "true" ]; then
+            echo "::error::Tagged Windows release with WINDOWS_SIGNED=true but the AZURE_* secrets are missing — an unsigned EXE is not a release."
+            exit 1
+          fi
+          # ⚠️ signExecutable=false IS THE ONLY SUPPORTED WAY TO BUILD UNSIGNED.
+          # With azureSignOptions configured and no credentials, electron-builder
+          # does NOT fail: it logs "signing failed for file, queue will continue"
+          # and ships the unsigned binary. So a build without credentials must
+          # say so explicitly, and a build WITH them must be checked afterwards
+          # (the Verify step) rather than trusted.
+          if [ "${{ matrix.os }}" = "windows-latest" ] && [ "$HAS_AZURE" != "true" ]; then
+            echo "note: no Azure signing secrets — Windows is built UNSIGNED, artifact only."
+            npm run pack:win -- -c.win.signExecutable=false
+            echo "WIN_UNSIGNED_BUILD=true" >> "$GITHUB_ENV"
+          elif [ "${{ matrix.os }}" = "windows-latest" ] && [ "$WIN_SIGNED" != "true" ]; then
+            echo "note: WINDOWS_SIGNED is not true — signing, but publishing to the artifact only."
             npm run pack:win
           elif [ "$IS_TAG" = "true" ]; then
             npm run release -- --${{ matrix.os == 'windows-latest' && 'win' || 'mac' }}
           else
             npm run ${{ matrix.script }}
           fi
+
+      # 🔴 FAIL IF UNSIGNED. electron-builder swallows a signing failure (see
+      # above), so "the build passed" proves nothing about the signature. Ask
+      # Windows itself: Get-AuthenticodeSignature must report Valid on the
+      # installer AND on the app executable inside it (the unpacked copy in
+      # dist/win-unpacked is byte-identical to what the installer lays down).
+      # Prints the signer subject — that string is what
+      # win.azureSignOptions.publisherName / electron-updater verify against.
+      - name: Verify Windows signatures
+        if: matrix.os == 'windows-latest' && env.WIN_UNSIGNED_BUILD != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          # ⚠️ ON DISK THE INSTALLER IS "Bipli Setup 0.1.2.exe" (spaces). The
+          # hyphenated Bipli-Setup-*.exe the web and the publish check look for
+          # is what electron-builder renames it to when it uploads to GitHub.
+          # The uninstaller stub (*__uninstaller.exe) is signed too but is an
+          # intermediate, not a deliverable; the installer embeds it.
+          $files = @(Get-ChildItem dist -Filter "Bipli*Setup*.exe" | Where-Object { $_.Name -notlike "*__uninstaller*" }) + @(Get-Item dist/win-unpacked/Bipli.exe)
+          if ($files.Count -lt 2) { Write-Host "::error::Expected the installer and dist/win-unpacked/Bipli.exe; found $($files.Count) file(s)."; exit 1 }
+          $bad = 0
+          foreach ($f in $files) {
+            $sig = Get-AuthenticodeSignature $f.FullName
+            $subject = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { "(none)" }
+            $ts = if ($sig.TimeStamperCertificate) { $sig.TimeStamperCertificate.Subject } else { "(no timestamp)" }
+            Write-Host "$($f.Name): $($sig.Status) signer=$subject timestamp=$ts"
+            if ($sig.Status -ne "Valid") { Write-Host "::error::$($f.Name) is not validly signed ($($sig.Status)): $($sig.StatusMessage)"; $bad++ }
+            elseif (-not $sig.TimeStamperCertificate) { Write-Host "::error::$($f.Name) is signed but not timestamped — the signature would expire with the certificate."; $bad++ }
+          }
+          if ($bad -gt 0) { exit 1 }
+          Write-Host "all Windows binaries signed and timestamped"
 
       # The key is a live credential; the runner is ephemeral but the artifact
       # step is not selective, so remove it explicitly either way.
@@ -297,5 +355,12 @@ jobs:
           echo "$assets"
           echo "$assets" | grep -q '\.zip$'   || { echo "::error::No macOS .zip in $TAG — electron-updater cannot update from a DMG-only release."; exit 1; }
           echo "$assets" | grep -q 'latest-mac.yml' || { echo "::error::No latest-mac.yml in $TAG — nothing to update from."; exit 1; }
+          # Windows is a release platform once WINDOWS_SIGNED is true: the
+          # signed installer AND latest.yml (what electron-updater on Windows
+          # reads) must both be present, or the release is not published.
+          if [ "${{ vars.WINDOWS_SIGNED == 'true' }}" = "true" ]; then
+            echo "$assets" | grep -q '^Bipli-Setup-.*\.exe$' || { echo "::error::No Bipli-Setup-*.exe in $TAG — the signed Windows build did not land."; exit 1; }
+            echo "$assets" | grep -qx 'latest.yml' || { echo "::error::No latest.yml in $TAG — Windows cannot auto-update from this release."; exit 1; }
+          fi
           gh release edit "$TAG" --draft=false
           echo "published $TAG"
