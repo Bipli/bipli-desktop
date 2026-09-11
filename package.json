@@ -57,7 +57,8 @@
       "azureSignOptions": {
         "endpoint": "https://eus.codesigning.azure.net/",
         "codeSigningAccountName": "bipli-signing",
-        "certificateProfileName": "bipli-public"
+        "certificateProfileName": "bipli-public",
+        "publisherName": "Bipli"
       }
     },
     "nsis": {
