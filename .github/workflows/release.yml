@@ -292,7 +292,12 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $files = @(Get-ChildItem dist -Filter "Bipli-Setup-*.exe") + @(Get-Item dist/win-unpacked/Bipli.exe)
+          # ⚠️ ON DISK THE INSTALLER IS "Bipli Setup 0.1.2.exe" (spaces). The
+          # hyphenated Bipli-Setup-*.exe the web and the publish check look for
+          # is what electron-builder renames it to when it uploads to GitHub.
+          # The uninstaller stub (*__uninstaller.exe) is signed too but is an
+          # intermediate, not a deliverable; the installer embeds it.
+          $files = @(Get-ChildItem dist -Filter "Bipli*Setup*.exe" | Where-Object { $_.Name -notlike "*__uninstaller*" }) + @(Get-Item dist/win-unpacked/Bipli.exe)
           if ($files.Count -lt 2) { Write-Host "::error::Expected the installer and dist/win-unpacked/Bipli.exe; found $($files.Count) file(s)."; exit 1 }
           $bad = 0
           foreach ($f in $files) {
