@@ -378,6 +378,56 @@ function createWindow() {
     `${win.webContents.getUserAgent()} BipliDesktop/${SHELL_VERSION}`,
   );
 
+  // =========================================================================
+  // Spellcheck that can actually be USED. Chromium underlined misspellings but
+  // an Electron window has no context menu unless we build one, so right-click
+  // offered nothing. This menu is deliberately small: the dictionary
+  // suggestions (replace in place), "Add to dictionary", and Cut/Copy/Paste
+  // where they make sense. Nothing else — it is a phone, not a browser.
+  //
+  // Languages: en-AU first, en-GB as the fallback dictionary. Windows/Linux
+  // only — on macOS Electron uses the OS spellchecker, which brings its own
+  // languages, and this call is a no-op there.
+  // =========================================================================
+  if (process.platform !== "darwin") {
+    try {
+      const wanted = ["en-AU", "en-GB"].filter((l) =>
+        session.defaultSession.availableSpellCheckerLanguages.includes(l),
+      );
+      if (wanted.length) session.defaultSession.setSpellCheckerLanguages(wanted);
+    } catch (e) {
+      log(`spellchecker languages not set: ${e && e.message ? e.message : e}`);
+    }
+  }
+  win.webContents.on("context-menu", (_event, params) => {
+    const items = [];
+    if (params.misspelledWord) {
+      for (const suggestion of (params.dictionarySuggestions || []).slice(0, 6)) {
+        items.push({
+          label: suggestion,
+          click: () => win.webContents.replaceMisspelling(suggestion),
+        });
+      }
+      if (items.length === 0) items.push({ label: "No suggestions", enabled: false });
+      items.push({
+        label: "Add to dictionary",
+        click: () =>
+          session.defaultSession.addWordToSpellCheckerDictionary(params.misspelledWord),
+      });
+      items.push({ type: "separator" });
+    }
+    const flags = params.editFlags || {};
+    if (params.isEditable) {
+      items.push({ role: "cut", enabled: !!flags.canCut });
+      items.push({ role: "copy", enabled: !!flags.canCopy });
+      items.push({ role: "paste", enabled: !!flags.canPaste });
+    } else if (params.selectionText && params.selectionText.trim()) {
+      items.push({ role: "copy" });
+    }
+    if (items.length === 0) return; // nothing useful to offer: no menu
+    Menu.buildFromTemplate(items).popup({ window: win });
+  });
+
   loadApp();
   win.webContents.on("did-fail-load", (_e, code, desc, url, isMainFrame) => {
     log(`LOAD FAILED ${code} ${desc} url=${url} mainFrame=${isMainFrame}`);
