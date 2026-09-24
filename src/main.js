@@ -281,6 +281,39 @@ function createWindow() {
     },
   });
 
+  // ── Links that LEAVE the app open in the system browser (2026-09-24) ──
+  // The shell is the product, not a browser. A marketing page reached inside
+  // it (the footer's Support link did this) has no way back and soft-locks the
+  // window. Only app paths on our origin may load here; every other URL —
+  // another origin, mailto:, or a marketing path on our own origin — goes to
+  // the system browser and the in-window navigation is denied. Programmatic
+  // loadURL/loadFile (loadApp, the tel: handler, the offline screen) do not
+  // fire will-navigate, so they are unaffected.
+  const MARKETING_PATHS = ["/why", "/features", "/pricing", "/about", "/contact", "/download", "/try", "/support", "/rates", "/legal"];
+  const isAppUrl = (raw) => {
+    try {
+      const u = new URL(raw);
+      if (u.origin !== ORIGIN) return false;
+      const p = u.pathname.replace(/\/+$/, "") || "/";
+      return !MARKETING_PATHS.some((m) => p === m || p.startsWith(m + "/"));
+    } catch {
+      return false;
+    }
+  };
+  const openOutside = (url, why) => {
+    log(`opening outside the shell (${why}): ${url}`);
+    shell.openExternal(url).catch((e) => log(`openExternal failed: ${e && e.message}`));
+  };
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    openOutside(url, "new window");
+    return { action: "deny" };
+  });
+  win.webContents.on("will-navigate", (event, url) => {
+    if (isAppUrl(url)) return;
+    event.preventDefault();
+    openOutside(url, "left the app");
+  });
+
   // ⚠️ SCOPED TO OUR ORIGIN, NOT BLANKET-GRANTED. The shell auto-grants media
   // and notifications for bipli.com so the user is not asked every launch —
   // that is the product decision. Everything else, and every other origin, is
