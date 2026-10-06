@@ -21,7 +21,7 @@
 // is a finding rather than something to work around.
 // =============================================================================
 
-const { app, BrowserWindow, Tray, Menu, session, ipcMain, powerSaveBlocker, nativeImage, shell } = require("electron");
+const { app, BrowserWindow, Tray, Menu, session, ipcMain, powerSaveBlocker, nativeImage, shell, net } = require("electron");
 const path = require("path");
 const { shouldShowOffline } = require("./load-failure");
 const { telUrlToNumber, telFromArgv } = require("./tel-url");
@@ -239,6 +239,7 @@ function clearLoadWatchdog() {
 
 function loadApp() {
   showingOffline = false;
+  stopReconnectPolling();
   clearLoadWatchdog();
   log(`loading ${BIPLI_URL}`);
   loadWatchdog = setTimeout(() => {
@@ -247,6 +248,45 @@ function loadApp() {
     showOffline(`no response after ${LOAD_TIMEOUT_MS / 1000}s`);
   }, LOAD_TIMEOUT_MS);
   win.loadURL(BIPLI_URL).catch((e) => log(`loadURL rejected: ${e && e.message}`));
+}
+
+// =============================================================================
+// RECONNECT (2026-10-06). The offline screen used to wait for a click. During a
+// Republish, Replit's proxy answers the main frame with a 5xx page (which is a
+// successful load as far as did-fail-load is concerned) and every tab showed
+// "Internal Server Error" until someone pressed Retry or Ctrl-Shift-R. Now:
+//   · a 5xx on the MAIN FRAME navigation shows the offline screen with the
+//     "just been updated" wording (reason prefixed "updating:");
+//   · while the offline screen is up, the MAIN process polls /api/health every
+//     few seconds (net.fetch: no CORS, works from a file:// page) and reloads
+//     the app the moment it answers 200. Retry still works for the impatient.
+// =============================================================================
+const HEALTH_URL = `${BIPLI_URL.replace(/\/$/, "")}/api/health`;
+const RECONNECT_POLL_MS = 3000;
+let reconnectTimer = null;
+
+function stopReconnectPolling() {
+  if (reconnectTimer) {
+    clearInterval(reconnectTimer);
+    reconnectTimer = null;
+  }
+}
+
+function startReconnectPolling() {
+  if (reconnectTimer) return;
+  log(`polling ${HEALTH_URL} every ${RECONNECT_POLL_MS / 1000}s until it answers`);
+  reconnectTimer = setInterval(async () => {
+    try {
+      const r = await net.fetch(`${HEALTH_URL}?t=${Date.now()}`, { cache: "no-store" });
+      if (r.ok) {
+        log("server is back — reloading the app");
+        stopReconnectPolling();
+        loadApp();
+      }
+    } catch (e) {
+      /* still down; the next tick asks again */
+    }
+  }, RECONNECT_POLL_MS);
 }
 
 function showOffline(reason) {
@@ -259,6 +299,7 @@ function showOffline(reason) {
   win.loadFile(path.join(__dirname, "offline.html"), { hash: encodeURIComponent(reason) })
     .catch((e) => log(`could not show offline screen: ${e && e.message}`));
   if (!win.isVisible()) win.show();
+  startReconnectPolling();
 }
 
 function createWindow() {
@@ -472,6 +513,15 @@ function createWindow() {
     // while they use it.
     if (!shouldShowOffline(code, isMainFrame)) return;
     showOffline(`${code} ${desc}`);
+  });
+  // A main-frame navigation that LOADED a 5xx page (the proxy during a
+  // Republish) is a failure did-fail-load never reports. Our own server's
+  // pages are never 5xx, so any 5xx here is "Bipli is being updated".
+  win.webContents.on("did-navigate", (_e, url, httpResponseCode, httpStatusText) => {
+    if (httpResponseCode >= 500 && /^https?:/.test(url) && !showingOffline) {
+      log(`main frame got HTTP ${httpResponseCode} ${httpStatusText} from ${url}`);
+      showOffline(`updating:${httpResponseCode} ${httpStatusText}`);
+    }
   });
   win.webContents.on("did-finish-load", () => {
     clearLoadWatchdog();

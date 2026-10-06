@@ -26,9 +26,10 @@
   .hint { margin-top: .9rem; font-size: 12.5px; color: #6B675F; }
 </style>
 <div class="card">
-  <h1>Can't reach bipli.com</h1>
-  <p>Bipli needs the internet to make and take calls. Check your connection, then try again.</p>
-  <button id="retry" type="button">Retry</button>
+  <h1 id="title">Can't reach bipli.com</h1>
+  <p id="body">Bipli needs the internet to make and take calls. Check your connection, then try again.</p>
+  <p class="hint" id="auto">Reconnecting automatically. This screen goes away on its own when Bipli answers.</p>
+  <button id="retry" type="button">Retry now</button>
   <div class="hint">
     Still stuck? Right-click the Bipli icon near the clock and choose
     <strong>Show log</strong>, then send us the file.
@@ -39,6 +40,13 @@
   // The reason arrives as a hash so this page needs no preload of its own and
   // no IPC to render: main.js loads it as offline.html#<code>|<description>.
   var raw = decodeURIComponent(location.hash.replace(/^#/, ""));
+  // "updating:<status>" = the server answered 5xx (a Republish in progress),
+  // not a connection problem: say so, and don't send anyone to check their wifi.
+  if (raw.indexOf("updating:") === 0) {
+    document.getElementById("title").textContent = "Bipli\u2019s just been updated.";
+    document.getElementById("body").textContent = "Reconnecting\u2026 the app reloads itself when the server\u2019s back. Nothing to do.";
+    raw = raw.slice("updating:".length);
+  }
   if (raw) document.getElementById("detail").textContent = raw;
   var btn = document.getElementById("retry");
   btn.addEventListener("click", function () {
