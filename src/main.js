@@ -25,6 +25,7 @@ const { app, BrowserWindow, Tray, Menu, session, ipcMain, powerSaveBlocker, nati
 const path = require("path");
 const { shouldShowOffline } = require("./load-failure");
 const { telUrlToNumber, telFromArgv } = require("./tel-url");
+const { deepLinkFromUrl, deepLinkFromArgv } = require("./deep-link");
 
 const BIPLI_URL = process.env.BIPLI_URL || "https://bipli.com";
 const SHELL_VERSION = require("../package.json").version;
@@ -83,6 +84,24 @@ app.setAppUserModelId("com.bipli.desktop");
 // ⚠️ REGISTRATION IS A REQUEST, NOT A FACT — see registerTelHandler().
 // =============================================================================
 let pendingTel = null;
+// bipli://call/<id> and bipli://thread/<key> (2026-10-14): the "Open in Bipli"
+// link in an email lands here when the app is installed. Same shape as tel:
+// — a pending slot for a cold start, the same two OS entry points.
+let pendingDeepLink = null;
+
+/** Navigate the app window to a deep link's path, or hold it until the window exists. */
+function openDeepLink(link) {
+  if (!link) return;
+  log(`deep link → ${link.path}`);
+  if (!win) {
+    pendingDeepLink = link; // cold start: the URL arrives before the window does
+    return;
+  }
+  const url = `${BIPLI_URL.replace(/\/$/, "")}${link.path}`;
+  win.loadURL(url).catch((e) => log(`deep link navigation failed: ${e && e.message}`));
+  if (!win.isVisible()) win.show();
+  win.focus();
+}
 
 /** Send a number to the dialler, or hold it until the window exists. */
 function openInDialler(number) {
@@ -107,6 +126,8 @@ if (!app.requestSingleInstanceLock()) {
   app.on("second-instance", (_e, argv) => {
     const n = telFromArgv(argv);
     if (n) openInDialler(n);
+    const d = deepLinkFromArgv(argv);
+    if (d) openDeepLink(d);
     if (win) {
       win.show();
       win.focus();
@@ -118,8 +139,10 @@ if (!app.requestSingleInstanceLock()) {
 app.on("open-url", (event, url) => {
   event.preventDefault();
   const n = telUrlToNumber(url);
-  log(`open-url ${url} → ${n ?? "(not a tel: URL)"}`);
+  const d = deepLinkFromUrl(url);
+  log(`open-url ${url} → ${n ?? (d ? d.path : "(not a tel: or bipli:// URL)")}`);
   if (n) openInDialler(n);
+  if (d) openDeepLink(d);
 });
 
 // =============================================================================
@@ -200,6 +223,9 @@ function registerTelHandler() {
     const asked = app.setAsDefaultProtocolClient("tel");
     const isDefault = app.isDefaultProtocolClient("tel");
     log(`tel: handler — setAsDefaultProtocolClient=${asked} isDefaultProtocolClient=${isDefault}`);
+    // bipli:// is ours alone, so no chooser: the OS has no other candidate.
+    const askedLink = app.setAsDefaultProtocolClient("bipli");
+    log(`bipli: handler — setAsDefaultProtocolClient=${askedLink} isDefaultProtocolClient=${app.isDefaultProtocolClient("bipli")}`);
     if (!isDefault) {
       log(
         "tel: Bipli is registered as a CANDIDATE but is not the default handler. " +
@@ -1012,6 +1038,9 @@ app.whenReady().then(() => {
   const cold = telFromArgv(process.argv);
   if (cold) openInDialler(cold);
   else if (pendingTel) { const n = pendingTel; pendingTel = null; openInDialler(n); }
+  const coldLink = deepLinkFromArgv(process.argv);
+  if (coldLink) openDeepLink(coldLink);
+  else if (pendingDeepLink) { const d = pendingDeepLink; pendingDeepLink = null; openDeepLink(d); }
 
   // Build the ring popup NOW, hidden. On the ring we only call show() — no
   // construction, no page load, no waiting for a first paint the compositor may

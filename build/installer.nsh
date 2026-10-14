@@ -26,10 +26,17 @@
   WriteRegStr SHCTX "Software\Classes\Bipli.tel\DefaultIcon" "" "$INSTDIR\${APP_EXECUTABLE_FILENAME},0"
   WriteRegStr SHCTX "Software\Classes\Bipli.tel\shell\open\command" "" '"$INSTDIR\${APP_EXECUTABLE_FILENAME}" "%1"'
 
+  ; bipli:// links ("Open in Bipli" from an email). Ours alone, so no chooser.
+  WriteRegStr SHCTX "Software\Classes\bipli" "" "URL:Bipli link"
+  WriteRegStr SHCTX "Software\Classes\bipli" "URL Protocol" ""
+  WriteRegStr SHCTX "Software\Classes\bipli\DefaultIcon" "" "$INSTDIR\${APP_EXECUTABLE_FILENAME},0"
+  WriteRegStr SHCTX "Software\Classes\bipli\shell\open\command" "" '"$INSTDIR\${APP_EXECUTABLE_FILENAME}" "%1"'
+
   ; Capabilities — what makes Bipli show up in Default apps.
   WriteRegStr SHCTX "Software\Bipli\Capabilities" "ApplicationName" "Bipli"
   WriteRegStr SHCTX "Software\Bipli\Capabilities" "ApplicationDescription" "Your Bipli phone on the desktop"
   WriteRegStr SHCTX "Software\Bipli\Capabilities\URLAssociations" "tel" "Bipli.tel"
+  WriteRegStr SHCTX "Software\Bipli\Capabilities\URLAssociations" "bipli" "bipli"
   WriteRegStr SHCTX "Software\RegisteredApplications" "Bipli" "Software\Bipli\Capabilities"
 !macroend
 
@@ -38,6 +45,7 @@
 ; uninstall that was supposed to fix it.
 !macro customUnInstall
   DeleteRegKey SHCTX "Software\Classes\Bipli.tel"
+  DeleteRegKey SHCTX "Software\Classes\bipli"
   DeleteRegKey SHCTX "Software\Bipli\Capabilities"
   DeleteRegValue SHCTX "Software\RegisteredApplications" "Bipli"
   DeleteRegKey SHCTX "Software\Classes\AppUserModelId\com.bipli.desktop"
