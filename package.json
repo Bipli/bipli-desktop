@@ -10,7 +10,8 @@
     "check:tel": "node scripts/check-tel-url.js",
     "pack:win": "electron-builder --win --x64 --publish never",
     "pack:mac": "electron-builder --mac --publish never",
-    "release": "electron-builder --publish always"
+    "release": "electron-builder --publish always",
+    "check:deep-link": "node scripts/check-deep-link.js"
   },
   "devDependencies": {
     "electron": "44.1.1",
@@ -34,6 +35,12 @@
         "name": "Phone call",
         "schemes": [
           "tel"
+        ]
+      },
+      {
+        "name": "Bipli link",
+        "schemes": [
+          "bipli"
         ]
       }
     ],
