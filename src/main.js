@@ -380,6 +380,20 @@ function createWindow() {
     event.preventDefault();
     openOutside(url, "left the app");
   });
+  // 🔴 A SERVER-SIDE redirect (302) fires will-redirect, NOT will-navigate. An
+  // OAuth "connect" is exactly this: the app path
+  // /api/integrations/servicem8/activate is same-origin (will-navigate lets it
+  // through), then the server 302s to go.servicem8.com/oauth/authorize — a
+  // redirect the will-navigate guard never sees, so the window followed it
+  // off-origin and the user was stranded on the provider's site with no way
+  // back. Same rule, both events: a redirect to anything that is not an app URL
+  // on our origin leaves for the system browser. This covers every integration's
+  // OAuth hop, present and future, not just ServiceM8.
+  win.webContents.on("will-redirect", (event, url) => {
+    if (isAppUrl(url)) return;
+    event.preventDefault();
+    openOutside(url, "redirected off the app");
+  });
 
   // ⚠️ SCOPED TO OUR ORIGIN, NOT BLANKET-GRANTED. The shell auto-grants media
   // and notifications for bipli.com so the user is not asked every launch —
