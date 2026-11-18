@@ -474,6 +474,29 @@ function createWindow() {
   win.on("minimize", () => log("window minimized"));
 
   // =========================================================================
+  // 🔑 RESTORE DOM INPUT FOCUS ON WINDOW FOCUS — one place, every screen.
+  //
+  // A page-level native dialog (window.confirm / alert / prompt — e.g. the
+  // "Delete this team?" confirm) is window-modal: on Windows it blurs the parent
+  // window and, on close, the window regains OS focus BUT the webContents is left
+  // without DOM input focus. The result is the "I can't click/type into the next
+  // dialog" lock that only an Alt+Tab (a real OS focus cycle) clears. This handler
+  // IS that Alt+Tab, done for them: every time the window regains focus — after a
+  // native dialog closes, or on Alt+Tab back — hand focus to the webContents so
+  // the active element is live again. Covers every current and future native
+  // dialog and every screen, and is independent of contextIsolation (a preload
+  // can't override the page's confirm with it on). webContents.focus() alone is
+  // enough here because the window is already OS-focused when this fires; it is a
+  // no-op when focus was never lost. The lasting fix is to migrate the client's
+  // ~25 window.confirm sites to our Radix dialogs (which don't steal OS focus),
+  // but this makes the shell correct regardless.
+  // =========================================================================
+  win.on("focus", () => {
+    try { if (win && !win.isDestroyed()) win.webContents.focus(); }
+    catch (e) { log(`refocus on window focus failed: ${e && e.message}`); }
+  });
+
+  // =========================================================================
   // 🔑 TWO INDEPENDENT SIGNALS THAT THIS IS THE SHELL, and the page hides its
   // "get the desktop app" prompt on EITHER.
   //
