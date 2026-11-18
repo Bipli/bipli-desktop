@@ -253,3 +253,52 @@ window.addEventListener("load", () => {
   void checkVersion();
   setInterval(() => void checkVersion(), VERSION_POLL_MS);
 });
+
+// =============================================================================
+// "A new version is available" PROMPT.
+//
+// The main process sends shell:update-available when a new build is seen AND the
+// window is focused (a user is here to act); an unfocused always-on window still
+// reloads silently when idle. The banner is injected from the PRELOAD, not the
+// page, so it appears even on the stale pre-deploy bundle that has no such code.
+// Reloading stays the main process's (call-aware) decision — this only asks.
+// =============================================================================
+function showUpdateBanner() {
+  if (document.getElementById("bipli-update-banner")) return;
+  const bar = document.createElement("div");
+  bar.id = "bipli-update-banner";
+  bar.setAttribute("role", "status");
+  bar.style.cssText =
+    "position:fixed;left:0;right:0;top:0;z-index:2147483647;display:flex;gap:12px;" +
+    "align-items:center;justify-content:center;padding:8px 12px;" +
+    "font:14px system-ui,-apple-system,sans-serif;background:#111827;color:#fff;" +
+    "box-shadow:0 1px 6px rgba(0,0,0,.35);pointer-events:auto";
+  const msg = document.createElement("span");
+  msg.id = "bipli-update-msg";
+  msg.textContent = "A new version of Bipli is available.";
+  const reload = document.createElement("button");
+  reload.textContent = "Reload";
+  reload.style.cssText =
+    "padding:4px 12px;border:0;border-radius:6px;background:#22c55e;color:#06281a;font-weight:600;cursor:pointer";
+  reload.onclick = () => {
+    reload.disabled = true;
+    msg.textContent = "Reloading…";
+    ipcRenderer.send("shell:reload-requested");
+  };
+  const later = document.createElement("button");
+  later.textContent = "Later";
+  later.style.cssText =
+    "padding:4px 12px;border:0;border-radius:6px;background:transparent;color:#9ca3af;cursor:pointer";
+  later.onclick = () => bar.remove();
+  bar.append(msg, reload, later);
+  (document.body || document.documentElement).appendChild(bar);
+}
+
+ipcRenderer.on("shell:update-available", () => {
+  try { showUpdateBanner(); }
+  catch (e) { console.log(`[spike-probe] update banner failed: ${e && e.message}`); }
+});
+ipcRenderer.on("shell:reload-held", () => {
+  const msg = document.getElementById("bipli-update-msg");
+  if (msg) msg.textContent = "You're on a call — Bipli will update when it ends.";
+});

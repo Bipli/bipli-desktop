@@ -894,7 +894,28 @@ function applyReloadIfIdle(why) {
 ipcMain.on("shell:build-changed", (_e, { commit }) => {
   pendingReloadBuild = commit || "new";
   log(`new build seen: ${pendingReloadBuild}`);
-  applyReloadIfIdle("build change");
+  // A user actively looking at the window is ASKED, not yanked: a silent
+  // reloadIgnoringCache would discard whatever dialog or half-typed form they are
+  // in (and leaving them on the stale pre-deploy bundle is the other failure we
+  // saw — a stale integration card + the old dialog behaviour). When the window is
+  // unfocused (the always-on phone sitting in the tray), reload silently as before.
+  if (win && !win.isDestroyed() && win.isFocused()) {
+    win.webContents.send("shell:update-available", { commit: pendingReloadBuild });
+  } else {
+    applyReloadIfIdle("build change (unfocused)");
+  }
+});
+
+// The in-page banner's Reload button. Still the MAIN process's call to reload:
+// mid-call it is HELD and applied when the call ends (setCallState → idle →
+// applyReloadIfIdle), and the banner is told so it can say as much.
+ipcMain.on("shell:reload-requested", () => {
+  if (callState !== "idle") {
+    log(`reload requested but ${callState} — held until idle`);
+    if (win && !win.isDestroyed()) win.webContents.send("shell:reload-held");
+    return;
+  }
+  applyReloadIfIdle("user clicked reload");
 });
 
 function reloadNow() {
